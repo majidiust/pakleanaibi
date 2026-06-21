@@ -1,0 +1,41 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body {
+  background: #0b1020;
+  color: #e6e9f5;
+  min-height: 100%;
+}
+
+@layer components {
+  .card {
+    @apply bg-panel border border-line rounded-xl;
+  }
+  .card-pad { @apply p-5; }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-md px-4 py-2
+           text-sm font-medium transition disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-primary { @apply btn bg-accent hover:bg-accent2 text-white; }
+  .btn-ghost   { @apply btn bg-transparent hover:bg-panel2 text-ink border border-line; }
+  .btn-danger  { @apply btn bg-err/90 hover:bg-err text-white; }
+  .input {
+    @apply w-full rounded-md bg-panel2 border border-line px-3 py-2 text-sm
+           text-ink placeholder:text-muted outline-none focus:border-accent;
+  }
+  .label { @apply text-xs uppercase tracking-wider text-muted; }
+  .pill  { @apply inline-flex items-center px-2 py-0.5 text-xs rounded-full
+                  bg-panel2 border border-line text-muted; }
+  .link  { @apply text-accent hover:underline; }
+  .table-wrap { @apply overflow-x-auto rounded-lg border border-line; }
+  table.bi { @apply w-full text-sm; }
+  table.bi thead th {
+    @apply text-left text-xs uppercase tracking-wider text-muted
+           bg-panel2 border-b border-line px-3 py-2 select-none;
+  }
+  table.bi tbody td {
+    @apply px-3 py-2 border-b border-line/70 align-top;
+  }
+  table.bi tbody tr:hover td { @apply bg-panel2/60; }
+}

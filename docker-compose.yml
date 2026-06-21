@@ -1,0 +1,238 @@
+services:
+  mongo-secondary:
+    image: mongo:8.0
+    container_name: paklean-mongo-secondary
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${SECONDARY_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${SECONDARY_PASSWORD}
+    ports:
+      - "${SECONDARY_PORT}:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - paklean-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ping:1}).ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  tunnel:
+    image: ginuerzh/gost:latest
+    container_name: paklean-tunnel
+    restart: unless-stopped
+    environment:
+      USE_PROXY: ${USE_PROXY}
+      PRIMARY_HOST: ${PRIMARY_HOST}
+      PRIMARY_PORT: ${PRIMARY_PORT}
+      PROXY_HOST: ${PROXY_HOST}
+      PROXY_PORT: ${PROXY_PORT}
+      PROXY_TYPE: ${PROXY_TYPE}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        if [ "$$USE_PROXY" = "true" ]; then
+          echo "[tunnel] :$$PRIMARY_PORT -> $$PRIMARY_HOST:$$PRIMARY_PORT via $$PROXY_TYPE://host.docker.internal:$$PROXY_PORT"
+          exec gost -L "tcp://:$$PRIMARY_PORT/$$PRIMARY_HOST:$$PRIMARY_PORT" -F "$$PROXY_TYPE://host.docker.internal:$$PROXY_PORT"
+        else
+          echo "[tunnel] :$$PRIMARY_PORT -> $$PRIMARY_HOST:$$PRIMARY_PORT (direct, no proxy)"
+          exec gost -L "tcp://:$$PRIMARY_PORT/$$PRIMARY_HOST:$$PRIMARY_PORT"
+        fi
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - paklean-net
+
+  # One-shot: mongodump the entire primary DB through the tunnel into a shared
+  # volume. Uses mongo:4.0 because its mongodump can talk to the legacy 3.4
+  # server (wire v5). Skips if the marker file already exists.
+  bootstrap-dump:
+    image: mongo:4.0
+    container_name: paklean-bootstrap-dump
+    restart: "no"
+    depends_on:
+      tunnel:
+        condition: service_started
+    environment:
+      PRIMARY_HOST: tunnel
+      PRIMARY_PORT: ${PRIMARY_PORT}
+      PRIMARY_DB: ${PRIMARY_DB}
+      PRIMARY_USERNAME: ${DB_USERNAME}
+      PRIMARY_PASSWORD: ${DB_PASSWORD}
+      PRIMARY_AUTH_SOURCE: ${PRIMARY_AUTH_SOURCE}
+    volumes:
+      - bootstrap_data:/dump
+    networks:
+      - paklean-net
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        if [ -f /dump/.dump_done ]; then
+          echo "[bootstrap-dump] /dump/.dump_done present, skipping"
+          exit 0
+        fi
+        echo "[bootstrap-dump] mongodump $$PRIMARY_HOST:$$PRIMARY_PORT/$$PRIMARY_DB -> /dump/primary.archive.gz"
+        mongodump \
+          --host="$$PRIMARY_HOST:$$PRIMARY_PORT" \
+          --username="$$PRIMARY_USERNAME" \
+          --password="$$PRIMARY_PASSWORD" \
+          --authenticationDatabase="$$PRIMARY_AUTH_SOURCE" \
+          --db="$$PRIMARY_DB" \
+          --gzip \
+          --archive=/dump/primary.archive.gz
+        touch /dump/.dump_done
+        echo "[bootstrap-dump] done ($$(du -h /dump/primary.archive.gz | cut -f1))"
+
+  # One-shot: mongorestore the dump produced above into the new secondary.
+  # Uses modern mongodb-database-tools because the target is mongo 8.x.
+  bootstrap-restore:
+    image: mongodb/mongodb-database-tools:latest
+    container_name: paklean-bootstrap-restore
+    restart: "no"
+    depends_on:
+      bootstrap-dump:
+        condition: service_completed_successfully
+      mongo-secondary:
+        condition: service_healthy
+    environment:
+      SECONDARY_USERNAME: ${SECONDARY_USERNAME}
+      SECONDARY_PASSWORD: ${SECONDARY_PASSWORD}
+      PRIMARY_DB: ${PRIMARY_DB}
+      SECONDARY_DB: ${SECONDARY_DB}
+    volumes:
+      - bootstrap_data:/dump
+    networks:
+      - paklean-net
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        if [ -f /dump/.restore_done ]; then
+          echo "[bootstrap-restore] /dump/.restore_done present, skipping"
+          exit 0
+        fi
+        echo "[bootstrap-restore] mongorestore /dump/primary.archive.gz -> mongo-secondary/$$SECONDARY_DB"
+        mongorestore \
+          --uri="mongodb://$$SECONDARY_USERNAME:$$SECONDARY_PASSWORD@mongo-secondary:27017/?authSource=admin" \
+          --nsFrom="$$PRIMARY_DB.*" \
+          --nsTo="$$SECONDARY_DB.*" \
+          --drop \
+          --gzip \
+          --archive=/dump/primary.archive.gz
+        touch /dump/.restore_done
+        echo "[bootstrap-restore] done"
+
+  sync:
+    build: ./sync
+    container_name: paklean-sync
+    restart: unless-stopped
+    depends_on:
+      mongo-secondary:
+        condition: service_healthy
+      tunnel:
+        condition: service_started
+      bootstrap-restore:
+        condition: service_completed_successfully
+    environment:
+      PRIMARY_HOST: tunnel
+      PRIMARY_PORT: ${PRIMARY_PORT}
+      PRIMARY_DB: ${PRIMARY_DB}
+      PRIMARY_USERNAME: ${DB_USERNAME}
+      PRIMARY_PASSWORD: ${DB_PASSWORD}
+      PRIMARY_AUTH_SOURCE: ${PRIMARY_AUTH_SOURCE}
+      SECONDARY_HOST: mongo-secondary
+      SECONDARY_PORT: 27017
+      SECONDARY_DB: ${SECONDARY_DB}
+      SECONDARY_USERNAME: ${SECONDARY_USERNAME}
+      SECONDARY_PASSWORD: ${SECONDARY_PASSWORD}
+      SECONDARY_AUTH_SOURCE: admin
+      SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS}
+      SYNC_BATCH_SIZE: ${SYNC_BATCH_SIZE}
+    networks:
+      - paklean-net
+
+  backup:
+    image: mongo:8.0
+    container_name: paklean-backup
+    restart: unless-stopped
+    depends_on:
+      mongo-secondary:
+        condition: service_healthy
+    environment:
+      MONGO_USER: ${SECONDARY_USERNAME}
+      MONGO_PASS: ${SECONDARY_PASSWORD}
+      INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS}
+      RETENTION: ${BACKUP_RETENTION}
+    volumes:
+      - ./backups:/backups
+    networks:
+      - paklean-net
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        mkdir -p /backups
+        while true; do
+          ts=$$(date -u +%Y%m%d_%H%M%SZ)
+          file="/backups/secondary_$$ts.archive.gz"
+          echo "[backup] $$(date -u +%FT%TZ) start -> $$file"
+          if mongodump --uri="mongodb://$$MONGO_USER:$$MONGO_PASS@mongo-secondary:27017/?authSource=admin" --gzip --archive=$$file; then
+            sz=$$(du -h $$file | cut -f1)
+            echo "[backup] ok ($$sz)"
+            ls -1t /backups/secondary_*.archive.gz 2>/dev/null | tail -n +$$((RETENTION+1)) | xargs -r rm -f
+          else
+            echo "[backup] FAILED"; rm -f $$file
+          fi
+          sleep $$((INTERVAL_HOURS*3600))
+        done
+
+  panel:
+    build: ./panel
+    container_name: paklean-panel
+    restart: unless-stopped
+    depends_on:
+      mongo-secondary:
+        condition: service_healthy
+    ports:
+      - "${PANEL_PORT}:3000"
+    environment:
+      NODE_ENV: production
+      MONGO_URI: mongodb://${SECONDARY_USERNAME}:${SECONDARY_PASSWORD}@mongo-secondary:27017/?authSource=admin
+      BI_DB: ${BI_DB}
+      DATA_DB: ${DATA_DB}
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_TTL_HOURS: ${JWT_TTL_HOURS}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL}
+      OPENAI_USE_PROXY: ${OPENAI_USE_PROXY}
+      PROXY_TYPE: ${PROXY_TYPE}
+      PROXY_HOST: host.docker.internal
+      PROXY_PORT: ${PROXY_PORT}
+      REPORT_MAX_ROWS: ${REPORT_MAX_ROWS}
+      REPORT_MAX_TIME_MS: ${REPORT_MAX_TIME_MS}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER}
+      HF_API_KEY: ${HF_API_KEY}
+      HF_EMBEDDING_MODEL: ${HF_EMBEDDING_MODEL}
+      CACHE_SIMILARITY_THRESHOLD: ${CACHE_SIMILARITY_THRESHOLD}
+      CACHE_TTL_DAYS: ${CACHE_TTL_DAYS}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - paklean-net
+
+networks:
+  paklean-net:
+    driver: bridge
+
+volumes:
+  mongo_data:
+  bootstrap_data:
