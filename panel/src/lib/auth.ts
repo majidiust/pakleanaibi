@@ -6,7 +6,11 @@ import { biDb } from './mongo';
 import { env } from './env';
 
 export const COOKIE = 'paklean_session';
-const KEY = new TextEncoder().encode(env.JWT_SECRET);
+let _key: Uint8Array | null = null;
+function key(): Uint8Array {
+  if (!_key) _key = new TextEncoder().encode(env.JWT_SECRET);
+  return _key;
+}
 
 export type Role = 'admin' | 'analyst' | 'viewer';
 export interface SessionUser {
@@ -29,12 +33,12 @@ export async function signSession(u: SessionUser): Promise<string> {
     .setSubject(u.sub)
     .setIssuedAt()
     .setExpirationTime(`${env.JWT_TTL_HOURS}h`)
-    .sign(KEY);
+    .sign(key());
 }
 
 export async function verifySession(token: string): Promise<SessionUser | null> {
   try {
-    const { payload } = await jwtVerify(token, KEY);
+    const { payload } = await jwtVerify(token, key());
     if (!payload.sub) return null;
     return {
       sub: String(payload.sub),

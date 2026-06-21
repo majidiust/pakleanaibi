@@ -1,5 +1,8 @@
-// Centralised env access. Throws early at first import if anything required is
-// missing, so misconfigured deployments fail loudly instead of half-working.
+// Centralised env access. Each field is evaluated lazily on first read so that
+// importing this module is safe during Next.js's "Collecting page data" phase
+// (which runs at `next build` time without runtime env). A misconfigured
+// deployment still fails loudly -- but on the first request that needs the
+// missing value, not at build time.
 function req(name: string): string {
   const v = process.env[name];
   if (!v || !v.trim()) throw new Error(`env var ${name} is required`);
@@ -17,29 +20,29 @@ function num(name: string, def: number): number {
 }
 
 export const env = {
-  MONGO_URI: req('MONGO_URI'),
-  BI_DB: opt('BI_DB', 'bi'),
-  DATA_DB: opt('DATA_DB', 'pakleandb'),
+  get MONGO_URI() { return req('MONGO_URI'); },
+  get BI_DB() { return opt('BI_DB', 'bi'); },
+  get DATA_DB() { return opt('DATA_DB', 'pakleandb'); },
 
-  ADMIN_EMAIL: opt('ADMIN_EMAIL', 'admin@paklean.local'),
-  ADMIN_PASSWORD: opt('ADMIN_PASSWORD', 'changeme-admin'),
+  get ADMIN_EMAIL() { return opt('ADMIN_EMAIL', 'admin@paklean.local'); },
+  get ADMIN_PASSWORD() { return opt('ADMIN_PASSWORD', 'changeme-admin'); },
 
-  JWT_SECRET: req('JWT_SECRET'),
-  JWT_TTL_HOURS: num('JWT_TTL_HOURS', 12),
+  get JWT_SECRET() { return req('JWT_SECRET'); },
+  get JWT_TTL_HOURS() { return num('JWT_TTL_HOURS', 12); },
 
-  OPENAI_API_KEY: opt('OPENAI_API_KEY', ''),
-  OPENAI_MODEL: opt('OPENAI_MODEL', 'gpt-4o-mini'),
-  OPENAI_USE_PROXY: opt('OPENAI_USE_PROXY', 'false') === 'true',
-  PROXY_TYPE: opt('PROXY_TYPE', 'socks5'),
-  PROXY_HOST: opt('PROXY_HOST', '127.0.0.1'),
-  PROXY_PORT: num('PROXY_PORT', 8080),
+  get OPENAI_API_KEY() { return opt('OPENAI_API_KEY', ''); },
+  get OPENAI_MODEL() { return opt('OPENAI_MODEL', 'gpt-4o-mini'); },
+  get OPENAI_USE_PROXY() { return opt('OPENAI_USE_PROXY', 'false') === 'true'; },
+  get PROXY_TYPE() { return opt('PROXY_TYPE', 'socks5'); },
+  get PROXY_HOST() { return opt('PROXY_HOST', '127.0.0.1'); },
+  get PROXY_PORT() { return num('PROXY_PORT', 8080); },
 
-  REPORT_MAX_ROWS: num('REPORT_MAX_ROWS', 1000),
-  REPORT_MAX_TIME_MS: num('REPORT_MAX_TIME_MS', 15000),
+  get REPORT_MAX_ROWS() { return num('REPORT_MAX_ROWS', 1000); },
+  get REPORT_MAX_TIME_MS() { return num('REPORT_MAX_TIME_MS', 15000); },
 
-  EMBEDDING_PROVIDER: (opt('EMBEDDING_PROVIDER', 'none') as 'none' | 'hf' | 'openai'),
-  HF_API_KEY: opt('HF_API_KEY', ''),
-  HF_EMBEDDING_MODEL: opt('HF_EMBEDDING_MODEL', 'sentence-transformers/all-MiniLM-L6-v2'),
-  CACHE_SIMILARITY_THRESHOLD: Number(opt('CACHE_SIMILARITY_THRESHOLD', '0.92')),
-  CACHE_TTL_DAYS: num('CACHE_TTL_DAYS', 30),
+  get EMBEDDING_PROVIDER() { return opt('EMBEDDING_PROVIDER', 'none') as 'none' | 'hf' | 'openai'; },
+  get HF_API_KEY() { return opt('HF_API_KEY', ''); },
+  get HF_EMBEDDING_MODEL() { return opt('HF_EMBEDDING_MODEL', 'sentence-transformers/all-MiniLM-L6-v2'); },
+  get CACHE_SIMILARITY_THRESHOLD() { return Number(opt('CACHE_SIMILARITY_THRESHOLD', '0.92')); },
+  get CACHE_TTL_DAYS() { return num('CACHE_TTL_DAYS', 30); },
 };

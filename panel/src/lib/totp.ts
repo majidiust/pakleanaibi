@@ -7,7 +7,11 @@ import { env } from './env';
 // Authy, etc. Drift of ±1 30-second window is tolerated.
 const ISSUER = 'Paklean BI';
 const PENDING_AUD = 'paklean-totp-pending';
-const KEY = new TextEncoder().encode(env.JWT_SECRET);
+let _key: Uint8Array | null = null;
+function key(): Uint8Array {
+  if (!_key) _key = new TextEncoder().encode(env.JWT_SECRET);
+  return _key;
+}
 
 export interface PendingTotpClaims {
   sub: string;
@@ -57,12 +61,12 @@ export async function signPending(claims: PendingTotpClaims): Promise<string> {
     .setAudience(PENDING_AUD)
     .setIssuedAt()
     .setExpirationTime('5m')
-    .sign(KEY);
+    .sign(key());
 }
 
 export async function verifyPending(token: string): Promise<PendingTotpClaims | null> {
   try {
-    const { payload } = await jwtVerify(token, KEY, { audience: PENDING_AUD });
+    const { payload } = await jwtVerify(token, key(), { audience: PENDING_AUD });
     if (!payload.sub) return null;
     return {
       sub: String(payload.sub),
