@@ -89,9 +89,10 @@ services:
         echo "[bootstrap-dump] done ($$(du -h /dump/primary.archive.gz | cut -f1))"
 
   # One-shot: mongorestore the dump produced above into the new secondary.
-  # Uses modern mongodb-database-tools because the target is mongo 8.x.
+  # The official mongo:8.0 image bundles mongodb-database-tools (mongorestore),
+  # so we reuse it instead of pulling a separate tools image.
   bootstrap-restore:
-    image: mongodb/mongodb-database-tools:latest
+    image: mongo:8.0
     container_name: paklean-bootstrap-restore
     restart: "no"
     depends_on:
