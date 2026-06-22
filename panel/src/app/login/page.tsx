@@ -68,14 +68,23 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="min-h-screen grid place-items-center px-4">
-      <div className="card w-full max-w-md card-pad">
-        <div className="mb-6">
-          <div className="text-xl font-semibold">Paklean BI</div>
-          <div className="text-sm text-muted">
-            {stage === 'password'
-              ? 'Sign in to access reporting and analytics.'
-              : 'Enter the 6-digit code from your authenticator app.'}
+    <div className="min-h-screen grid place-items-center px-4 relative overflow-hidden">
+      <div aria-hidden className="pointer-events-none absolute inset-0 -z-10
+        [background:radial-gradient(800px_400px_at_50%_-10%,rgba(99,102,241,0.18),transparent_60%),radial-gradient(700px_400px_at_50%_110%,rgba(139,92,246,0.10),transparent_60%)]" />
+      <div className="card w-full max-w-md card-pad-lg shadow-elev-3">
+        <div className="mb-6 flex items-center gap-3">
+          <div className="size-9 rounded-lg grid place-items-center bg-gradient-to-br from-accent to-accent2 shadow-elev-2">
+            <svg viewBox="0 0 20 20" className="size-5 text-white" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <path d="M4 14V6l4 5 4-7 4 10" />
+            </svg>
+          </div>
+          <div>
+            <div className="text-lg font-semibold tracking-tightish">Paklean BI</div>
+            <div className="text-xs text-muted">
+              {stage === 'password'
+                ? 'Sign in to access reporting and analytics.'
+                : 'Enter the 6-digit code from your authenticator app.'}
+            </div>
           </div>
         </div>
         {stage === 'password' ? (

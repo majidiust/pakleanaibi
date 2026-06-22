@@ -11,7 +11,11 @@ export default async function PanelLayout({ children }: { children: ReactNode })
   return (
     <div className="flex min-h-screen">
       <Sidebar user={{ name: user.name, email: user.email, role: user.role }} />
-      <main className="flex-1 p-6 max-w-[1400px] w-full mx-auto">{children}</main>
+      <main className="flex-1 min-w-0">
+        <div className="px-6 lg:px-8 py-6 lg:py-8 mx-auto max-w-[1400px] w-full">
+          {children}
+        </div>
+      </main>
     </div>
   );
 }
