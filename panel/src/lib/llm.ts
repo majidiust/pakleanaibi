@@ -368,6 +368,37 @@ Rules for choice:
   "filter only Iran", "show as bar chart"), revise the previous report and
   return kind="report".
 
+CLARIFYING QUESTIONS — WHEN TO ASK (do not silently guess):
+You are a senior analyst having a fluent conversation, not a one-shot
+translator. Asking ONE precise question is cheaper than running a wrong
+report. Ask (kind="question") when ANY of these apply:
+- Date column choice is ambiguous: more than one date-shaped field exists
+  on the candidate collection (e.g. dCreateDate, dUpdateDate, dPaidDate,
+  dCompletedDate). Quote the candidates back and ask which one matches
+  "ordered" / "completed" / "paid" / etc.
+- The date column the user implied is missing OR its storage format is
+  unclear from the digest (no !bsonDate / !dateString / !millis tag).
+  Offer to fall back to _id timestamps and confirm.
+- A previous filter returned zero rows AND the date column is stored as
+  a string (you'll see the !dateString tag): confirm whether to compare
+  as ISO string or wrap with $toDate.
+- Range boundaries are unclear: "this month" — calendar month UTC vs the
+  caller's local timezone (Iran is UTC+03:30), "last month" vs "last 30
+  days", inclusive vs exclusive end. When the answer materially changes
+  the row count, ask.
+- Status/state filter values are not obvious from the schema's enum
+  values: "completed orders" could be messageState="done" or status=
+  "completed" or isCompleted=true depending on the collection. Ask which
+  enum value(s) the user means and quote the observable enum values.
+- The user references a NAME (not an ObjectId hex) and more than one
+  named entity collection could match: ask which collection.
+Do not ask when:
+- A single reasonable interpretation exists. Run the report and explain
+  the assumption in "message".
+- The user already answered the same question earlier in this thread.
+- A pending execution error is present (you are in repair mode — fix it,
+  don't ask).
+
 Constraints on report output (when kind="report"):
 - "collection" and field names must exist in the schema (English, exact).
 - Allowed stages only: $match, $project, $group, $sort, $limit, $skip,
@@ -640,6 +671,24 @@ function dateHandlingBlock(): string {
     '- Example correct: {"$match": {"dCreateDate": {"$gte": {"$date": "2026-05-23T00:00:00Z"}}}}',
     '- Example WRONG (will silently match nothing on 3.4): {"$match": {"dCreateDate": {"$gte": "2026-05-23T00:00:00Z"}}}',
     '- For "last N days/hours/months", compute the cutoff yourself relative to "Current UTC date/time" above. Do NOT use any cutoff that is older than that (no stale training-data dates).',
+    '',
+    'STORAGE FORMAT — INSPECT BEFORE FILTERING:',
+    'The schema digest annotates date-like fields with the actual storage format observed in sampled documents, plus a concrete example value. Pick the filter strategy based on that tag:',
+    '- "<field>:date!bsonDate=2026-05-23T08:14:00.000Z" → real BSON Date. Filter directly with {"$gte": {"$date": "..."}}. This is the easy case.',
+    '- "<field>:string!dateString=\\"2026-05-23T08:14:00\\"" → date stored as STRING. {"$date": "..."} silently matches nothing here. Two options: (a) compare as a string with a lexicographically-ordered ISO cutoff: {"$gte": "2026-05-23T00:00:00"}, which works because ISO-8601 is sort-stable; or (b) wrap the field with $toDate inside an $addFields stage first, then filter the converted field.',
+    '- "<field>:number!millis=1716451200000" → epoch millis as a number. Compare with a numeric cutoff: {"$gte": <millis>} (compute the millis from the current UTC date/time above).',
+    '- If a field looks date-related (created/updated/at/date/time in the name) but the digest shows NEITHER a date tag NOR a date-shaped example, do NOT assume the format. Ask the user (kind="question") or fall back to the _id timestamp trick below.',
+    '',
+    'OBJECTID _id DATE EXTRACTION (the universal fallback):',
+    'Every MongoDB ObjectId embeds the document\'s creation timestamp in its first 4 bytes. When no explicit date column exists, OR when the date column is unreliable/sparse/wrong-format, use _id instead:',
+    '- Filter "documents created since X" without a date column:',
+    '    { "$match": { "_id": { "$gte": {"$oid": "<24-hex of an ObjectId whose timestamp = X>"} } } }',
+    '  The driver compares ObjectIds byte-wise and the timestamp is the high-order prefix, so this is index-friendly. Use the EJSON form {"$oid": "..."} for the literal so the driver coerces it to a real ObjectId. Construct the boundary id by appending "0000000000000000" (16 hex zeros) to the 8-hex epoch-seconds of X. Example for 2026-06-01T00:00:00Z (epoch 1748736000 → hex "68424300"): {"$oid": "684243000000000000000000"}.',
+    '- Group/project the timestamp out of _id when the user wants to see or bucket by creation date:',
+    '    { "$addFields": { "_createdAt": { "$toDate": "$_id" } } }',
+    '  ($toDate of an ObjectId returns the embedded BSON Date. Available on 3.6+.) Then $match / $group / $dateToString on "$_createdAt" as if it were a real date column.',
+    '- When repairing a failed date filter that returned zero rows, ALWAYS consider switching to the _id strategy. It is the most reliable creation-time signal in this database.',
+    '- Caveat: _id reflects DOCUMENT CREATION, not "order placed" or "shipment made". If the user\'s intent is a business event with its own timestamp field, prefer that field; only fall back to _id when nothing better exists or when the named date column is broken.',
   ].join('\n');
 }
 

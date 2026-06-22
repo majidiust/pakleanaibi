@@ -110,6 +110,44 @@ export async function invalidateSchemaCache(): Promise<void> {
   } catch { /* best-effort */ }
 }
 
+// True when a string value looks like a serialized date. Date-stored-as-string
+// is a common pattern in legacy collections and produces silent zero-row
+// matches when compared as a BSON Date with {"$date": ...} — surfacing the
+// example lets the model spot the mismatch and switch to $toDate / regex.
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
+function looksLikeDateString(v: unknown): boolean {
+  return typeof v === 'string' && v.length >= 8 && v.length <= 40 && ISO_DATE_RE.test(v);
+}
+function looksLikeMillisNumber(v: unknown): boolean {
+  // Millis since epoch from year 2000 onward, capped at year 2200 to avoid
+  // misclassifying ordinary id / count / amount values.
+  return typeof v === 'number' && Number.isInteger(v) && v >= 946_684_800_000 && v <= 7_258_118_400_000;
+}
+
+// Compact rendering of an example value for the schema prompt. Keeps the
+// payload small (LLM context budget) while preserving enough shape for the
+// model to recognise BSON Date vs ISO-string vs numeric-millis storage.
+function formatExample(v: unknown): string | null {
+  if (v === null || v === undefined) return null;
+  if (v instanceof Date) return v.toISOString();
+  const bsonType = (v as { _bsontype?: string })._bsontype;
+  if (bsonType === 'ObjectId') return `ObjectId("${String(v)}")`;
+  if (typeof v === 'string') return v.length > 60 ? JSON.stringify(v.slice(0, 60) + '…') : JSON.stringify(v);
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  return null; // skip arrays/objects — too noisy for the prompt
+}
+
+// True when the field is plausibly a timestamp the model might filter on,
+// either by declared BSON type, by name hint, or by example shape.
+const DATE_NAME_RE = /^(d|dt)?(create|update|modif|delete|edit|publish|expire|order|complete|finish|start|end|sent|received|read|seen|login|signup|register|paid|refund|ship|deliver)/i;
+const DATE_SUFFIX_RE = /(date|time|at|on|when|stamp|ts)$/i;
+function isDateLikeField(name: string, types: string[], example: unknown): boolean {
+  if (types.includes('date')) return true;
+  if (DATE_NAME_RE.test(name) || DATE_SUFFIX_RE.test(name)) return true;
+  if (looksLikeDateString(example) || looksLikeMillisNumber(example)) return true;
+  return false;
+}
+
 // Compact text form used inside the LLM system prompt. We list collections
 // with their fields and -- crucially -- a JOIN RECIPES section that spells
 // out ready-to-paste $lookup stages in BOTH directions for every
@@ -120,7 +158,25 @@ export async function invalidateSchemaCache(): Promise<void> {
 export function schemaToPrompt(s: SchemaDigest): string {
   const lines: string[] = [`Database: ${s.database}`, `Collections (sorted by row count):`];
   for (const c of s.collections) {
-    const fields = c.fields.map(f => `${f.name}:${f.types.join('|')}`).join(', ');
+    const fields = c.fields.map(f => {
+      // Annotate the type tag with a storage hint for fields that the model
+      // is likely to filter on (date columns and _id ObjectIds). The hint is
+      // derived from the actual sampled value so a date-stored-as-string is
+      // visibly distinguished from a real BSON Date.
+      let typeTag = f.types.join('|');
+      if (isDateLikeField(f.name, f.types, f.example)) {
+        if (f.types.includes('date')) typeTag += '!bsonDate';
+        else if (looksLikeDateString(f.example)) typeTag += '!dateString';
+        else if (looksLikeMillisNumber(f.example)) typeTag += '!millis';
+      }
+      const ex = formatExample(f.example);
+      // Surface examples for date-like fields and the canonical _id ObjectId
+      // (so the model is reminded it can extract a creation timestamp from
+      // an _id without a dedicated date column). Other fields keep the
+      // existing terse `name:type` form so the digest stays compact.
+      const showExample = ex && (isDateLikeField(f.name, f.types, f.example) || f.name === '_id');
+      return showExample ? `${f.name}:${typeTag}=${ex}` : `${f.name}:${typeTag}`;
+    }).join(', ');
     lines.push(`- ${c.name} (~${c.count} docs): ${fields}`);
   }
   const rels = s.relationships ?? [];
