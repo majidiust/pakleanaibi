@@ -188,6 +188,25 @@ export function lowerPipeline(
     if (node instanceof Date) return node;
     if (Array.isArray(node)) return node.map(walk);
     const o = node as Record<string, unknown>;
+    // EJSON date literal -> real BSON Date. Required everywhere because the
+    // MongoDB driver, when handed a plain {$date: "..."} object as a query
+    // value, does NOT auto-decode it; it sends it as an embedded document
+    // and the server compares Date >= Object -- which silently matches
+    // nothing under BSON type bracketing. We unconditionally rewrite so the
+    // driver serialises a real Date.
+    const keys = Object.keys(o);
+    if (keys.length === 1 && keys[0] === '$date') {
+      const v = o.$date;
+      let ms: number | string | null = null;
+      if (typeof v === 'string' || typeof v === 'number') ms = v;
+      else if (v && typeof v === 'object' && '$numberLong' in (v as Record<string, unknown>)) {
+        ms = Number((v as { $numberLong: unknown }).$numberLong);
+      }
+      if (ms !== null) {
+        const d = new Date(ms);
+        if (!Number.isNaN(d.getTime())) return d;
+      }
+    }
     // Lower $dateSubtract / $dateAdd if not supported.
     for (const op of ['$dateSubtract', '$dateAdd'] as const) {
       if (op in o && !supports(op)) {

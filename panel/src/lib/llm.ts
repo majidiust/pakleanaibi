@@ -442,12 +442,39 @@ function versionCapsBlock(v?: { major: number; minor: number; raw: string } | nu
   if (!v) return '';
   const ge = (M: number, m: number) => v.major > M || (v.major === M && v.minor >= m);
   const lines: string[] = [`Target MongoDB server: ${v.raw} (treat as ${v.major}.${v.minor}).`];
-  if (!ge(4, 2)) lines.push('- $$NOW and $$CLUSTER_TIME are NOT available. For "last N days" filters use a literal ISO date placeholder like "2024-01-01T00:00:00Z" — the server will substitute the current date at run time.');
-  if (!ge(5, 0)) lines.push('- $dateSubtract, $dateAdd, $dateDiff, $dateTrunc are NOT available. For date math, use literal ISO date values; for time bucketing use $dateToString with format strings (e.g. "%Y-%m" for monthly, "%Y-%m-%d" for daily).');
+  if (!ge(4, 2)) lines.push('- $$NOW and $$CLUSTER_TIME are NOT available.');
+  if (!ge(5, 0)) lines.push('- $dateSubtract, $dateAdd, $dateDiff, $dateTrunc are NOT available. For time bucketing use $dateToString with format strings (e.g. "%Y-%m" for monthly, "%Y-%m-%d" for daily).');
   if (!ge(4, 0)) lines.push('- $lookup with "let"+"pipeline" syntax is NOT available; use the simple localField/foreignField form.');
   if (!ge(3, 6)) lines.push('- $expr is NOT available.');
-  lines.push('- Always put $dateSubtract/$dateAdd inside $expr if used in $match. Otherwise prefer a literal ISO date for the cutoff.');
   return lines.join('\n');
+}
+
+// Critical date-handling block. The LLM has no clock of its own, so the
+// current time has to be injected every turn. BSON Date fields can ONLY be
+// compared against real BSON dates -- a string ISO date used as the right
+// hand side of $gte against a Date field silently matches nothing on 3.4
+// due to BSON type bracketing. We require EJSON {"$date": "..."} form for
+// every date literal; the pipeline-guard lowering pass converts those to
+// real Date objects before the query reaches MongoDB.
+function dateHandlingBlock(): string {
+  const now = new Date();
+  const iso = now.toISOString();
+  const isoMinusN = (days: number) => new Date(now.getTime() - days * 86_400_000).toISOString();
+  return [
+    `Current UTC date/time: ${iso}.`,
+    `Common cutoff helpers (precomputed for your convenience -- use ONLY if it matches the requested range exactly, otherwise compute the right one from "Current UTC date/time"):`,
+    `  last 24h cutoff: ${isoMinusN(1)}`,
+    `  last  7d cutoff: ${isoMinusN(7)}`,
+    `  last 30d cutoff: ${isoMinusN(30)}`,
+    `  last 90d cutoff: ${isoMinusN(90)}`,
+    `  last 365d cutoff: ${isoMinusN(365)}`,
+    '',
+    'STRICT date-literal rule:',
+    '- Whenever a pipeline value represents a date/datetime (any $match filter on a "date"-typed field, any $project expression producing a date, any boundary value), express it as the EJSON object {"$date": "<full ISO-8601 string with Z>"}, NEVER as a bare string.',
+    '- Example correct: {"$match": {"dCreateDate": {"$gte": {"$date": "2026-05-23T00:00:00Z"}}}}',
+    '- Example WRONG (will silently match nothing on 3.4): {"$match": {"dCreateDate": {"$gte": "2026-05-23T00:00:00Z"}}}',
+    '- For "last N days/hours/months", compute the cutoff yourself relative to "Current UTC date/time" above. Do NOT use any cutoff that is older than that (no stale training-data dates).',
+  ].join('\n');
 }
 
 export async function agenticReport(ctx: AgenticContext, digest: SchemaDigest): Promise<AgenticTurn> {
@@ -455,6 +482,7 @@ export async function agenticReport(ctx: AgenticContext, digest: SchemaDigest): 
   const sysCtx = [
     `Max rows: ${env.REPORT_MAX_ROWS}.`,
     versionCapsBlock(ctx.serverVersion),
+    dateHandlingBlock(),
     `Schema digest:\n${schemaToPrompt(digest)}`,
     ctx.lastReport
       ? `Previous report (you may revise this if the user asks):\n${JSON.stringify(ctx.lastReport, null, 2)}`
