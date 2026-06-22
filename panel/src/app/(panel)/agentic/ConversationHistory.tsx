@@ -5,6 +5,7 @@ import { exportConversation, type ExportableConversation, type ExportUser } from
 export interface ConversationSummary {
   id: string;
   title: string;
+  description: string;
   messageCount: number;
   createdAt: string;
   updatedAt: string;
@@ -47,6 +48,13 @@ export function ConversationHistory({ currentId, refreshKey, user, onLoad, onDel
   const [items, setItems] = useState<ConversationSummary[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // Inline-edit state: when editingId is set, that row swaps to a form with
+  // title + description fields. Drafts are kept locally so cancelling discards
+  // changes without an extra reload round-trip.
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [draftTitle, setDraftTitle] = useState('');
+  const [draftDescription, setDraftDescription] = useState('');
+  const [saving, setSaving] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
 
   const reload = useCallback(async () => {
@@ -77,6 +85,38 @@ export function ConversationHistory({ currentId, refreshKey, user, onLoad, onDel
     if (!r.ok) { alert('Failed to delete'); return; }
     setItems(prev => prev?.filter(c => c.id !== id) ?? null);
     onDeleted(id);
+  }
+
+  function startEdit(c: ConversationSummary) {
+    setEditingId(c.id);
+    setDraftTitle(c.title);
+    setDraftDescription(c.description ?? '');
+  }
+  function cancelEdit() {
+    setEditingId(null);
+    setDraftTitle('');
+    setDraftDescription('');
+  }
+  async function saveEdit() {
+    if (!editingId) return;
+    const title = draftTitle.trim();
+    if (!title) { alert('Title cannot be empty'); return; }
+    setSaving(true);
+    try {
+      const r = await fetch(`/api/agentic/conversations/${editingId}`, {
+        method: 'PATCH', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ title, description: draftDescription.trim() }),
+      });
+      if (!r.ok) { alert('Failed to save'); return; }
+      // Patch the cached list in place so the popover stays scrolled to the
+      // same position; no need to refetch the full list.
+      setItems(prev => prev?.map(c => c.id === editingId
+        ? { ...c, title, description: draftDescription.trim() }
+        : c) ?? null);
+      cancelEdit();
+    } finally {
+      setSaving(false);
+    }
   }
 
   // Per-row export: hydrate the full conversation (the list view drops
@@ -119,7 +159,38 @@ export function ConversationHistory({ currentId, refreshKey, user, onLoad, onDel
                 No saved conversations yet. Each chat you start is auto-saved here.
               </div>
             )}
-            {items?.map(c => (
+            {items?.map(c => editingId === c.id ? (
+              // Edit form for this row — replaces the read-only line so the
+              // popover height stays bounded. Click-through is disabled here
+              // because the parent <div> handler would otherwise close the
+              // popover on every text-input click.
+              <div key={c.id} className="px-3 py-2 border-b border-line/60 bg-panel2/30 space-y-2"
+                onClick={(e) => e.stopPropagation()}>
+                <input
+                  className="input input-sm w-full text-sm"
+                  dir="auto"
+                  value={draftTitle}
+                  onChange={e => setDraftTitle(e.target.value)}
+                  placeholder="Title"
+                  maxLength={160}
+                  disabled={saving}
+                  autoFocus />
+                <textarea
+                  className="input w-full text-xs min-h-[60px]"
+                  dir="auto"
+                  value={draftDescription}
+                  onChange={e => setDraftDescription(e.target.value)}
+                  placeholder="Description (optional) — what's this conversation about?"
+                  maxLength={2000}
+                  disabled={saving} />
+                <div className="flex items-center justify-end gap-2">
+                  <button type="button" className="btn-ghost btn-sm" onClick={cancelEdit} disabled={saving}>Cancel</button>
+                  <button type="button" className="btn-primary btn-sm" onClick={() => void saveEdit()} disabled={saving || !draftTitle.trim()}>
+                    {saving ? 'Saving…' : 'Save'}
+                  </button>
+                </div>
+              </div>
+            ) : (
               <div key={c.id}
                 className={[
                   'group px-3 py-2 border-b border-line/60 flex items-start gap-2 cursor-pointer hover:bg-panel2/60',
@@ -128,6 +199,11 @@ export function ConversationHistory({ currentId, refreshKey, user, onLoad, onDel
                 onClick={() => { void onLoad(c.id); setOpen(false); }}>
                 <div className="flex-1 min-w-0">
                   <div dir="auto" className="text-sm text-ink truncate" title={c.title}>{c.title}</div>
+                  {c.description && (
+                    <div dir="auto" className="text-2xs text-muted-2 mt-0.5 line-clamp-2 whitespace-pre-wrap" title={c.description}>
+                      {c.description}
+                    </div>
+                  )}
                   <div className="text-2xs text-muted mt-0.5 flex items-center gap-2">
                     <span>{relTime(c.updatedAt)}</span>
                     <span>·</span>
@@ -136,6 +212,12 @@ export function ConversationHistory({ currentId, refreshKey, user, onLoad, onDel
                   </div>
                 </div>
                 <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100">
+                  <button
+                    type="button"
+                    className="text-muted hover:text-ink text-xs"
+                    onClick={(e) => { e.stopPropagation(); startEdit(c); }}
+                    title="Rename / describe"
+                    aria-label="Edit conversation">✎</button>
                   <button
                     type="button"
                     className="text-muted hover:text-ink text-xs"

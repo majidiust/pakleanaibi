@@ -23,6 +23,7 @@ interface LlmReport {
 export interface ExportableConversation {
   id: string;
   title?: string;
+  description?: string;
   history?: ChatMsg[];
   lastReport?: LlmReport | null;
   createdAt?: string | Date | null;
@@ -78,6 +79,9 @@ export function formatConversationAsText(conv: ExportableConversation, user: Exp
   lines.push(`  Agentic Conversation Export`);
   lines.push('================================================================');
   lines.push(`Title          : ${conv.title || 'Untitled'}`);
+  if (conv.description && conv.description.trim()) {
+    lines.push(`Description    : ${conv.description.trim().replace(/\n/g, '\n                 ')}`);
+  }
   lines.push(`Conversation ID: ${conv.id}`);
   lines.push(`Created at     : ${fmtDate(conv.createdAt)}`);
   lines.push(`Updated at     : ${fmtDate(conv.updatedAt)}`);

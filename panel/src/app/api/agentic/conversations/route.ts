@@ -18,6 +18,7 @@ const ChatMsg = z.object({
 // route, so strict validation lives on the agentic POST handler instead.
 const Body = z.object({
   title: z.string().max(160).optional(),
+  description: z.string().max(2000).optional(),
   history: z.array(ChatMsg).max(400).optional(),
   lastReport: z.record(z.unknown()).nullable().optional(),
 });
@@ -43,6 +44,7 @@ export async function GET() {
     conversations: rows.map(r => ({
       id: String(r._id),
       title: r.title ?? 'Untitled',
+      description: r.description ?? '',
       messageCount: r.messageCount ?? 0,
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
@@ -62,6 +64,7 @@ export async function POST(req: Request) {
     _id: new ObjectId(),
     userId: me.sub,
     title: parsed.data.title?.trim() || derivedTitle(history),
+    description: parsed.data.description?.trim() ?? '',
     history,
     lastReport: parsed.data.lastReport ?? null,
     messageCount: history.length,
@@ -73,6 +76,7 @@ export async function POST(req: Request) {
   return NextResponse.json({
     id: String(doc._id),
     title: doc.title,
+    description: doc.description,
     messageCount: doc.messageCount,
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,

@@ -15,6 +15,7 @@ const ChatMsg = z.object({
 
 const Patch = z.object({
   title: z.string().min(1).max(160).optional(),
+  description: z.string().max(2000).optional(),
   history: z.array(ChatMsg).max(400).optional(),
   lastReport: z.record(z.unknown()).nullable().optional(),
 });
@@ -33,6 +34,7 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
   return NextResponse.json({
     id: String(doc._id),
     title: doc.title ?? 'Untitled',
+    description: doc.description ?? '',
     history: doc.history ?? [],
     lastReport: doc.lastReport ?? null,
     messageCount: doc.messageCount ?? 0,
@@ -51,6 +53,7 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
   }
   const set: Record<string, unknown> = { updatedAt: new Date() };
   if (parsed.data.title !== undefined) set.title = parsed.data.title.trim();
+  if (parsed.data.description !== undefined) set.description = parsed.data.description.trim();
   if (parsed.data.history !== undefined) {
     set.history = parsed.data.history;
     set.messageCount = parsed.data.history.length;
