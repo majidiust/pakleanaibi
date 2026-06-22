@@ -50,39 +50,44 @@ export async function POST(req: Request) {
     }, { status: 502 });
   }
 
-  // Defensive shape check: even when the LLM says kind='report' the report
-  // object can be partially formed when strict JSON schema validation isn't
-  // enforced server-side. Downgrade malformed reports to a question turn so
-  // the UI never crashes on missing nested fields.
+  // The JSON schema we send to the LLM is non-strict, so the model can
+  // produce a "report" turn with partially-formed fields. Required for
+  // execution are collection + pipeline; everything else gets safe
+  // defaults so the UI always renders something actionable.
   const r = turn.report;
-  const validShape =
+  const ALLOWED_DISPLAYS = ['table', 'bar', 'line', 'pie', 'area'] as const;
+  type DKind = (typeof ALLOWED_DISPLAYS)[number];
+  const hasCore =
     turn.kind === 'report' &&
     r && typeof r === 'object' &&
-    typeof r.collection === 'string' &&
-    Array.isArray(r.pipeline) &&
-    r.display && typeof r.display === 'object' &&
-    typeof (r.display as { kind?: unknown }).kind === 'string';
+    typeof r.collection === 'string' && r.collection.length > 0 &&
+    Array.isArray(r.pipeline) && r.pipeline.length > 0;
 
-  if (!validShape) {
+  if (!hasCore) {
     return NextResponse.json({
       kind: 'question',
       message: turn.message || 'Could you tell me which collection and time range you have in mind?',
     });
   }
 
-  // Normalize the report so downstream consumers can rely on its shape.
+  const rawDisplay = (r!.display ?? {}) as Partial<LlmReport['display']> & { kind?: unknown };
+  const dKind: DKind = (ALLOWED_DISPLAYS as readonly string[]).includes(rawDisplay.kind as string)
+    ? (rawDisplay.kind as DKind)
+    : 'table';
   const normalized: LlmReport = {
     collection: r!.collection,
     pipeline: r!.pipeline,
     display: {
-      kind: r!.display.kind,
-      xField: r!.display.xField,
-      yField: r!.display.yField,
-      seriesField: r!.display.seriesField,
-      title: r!.display.title,
+      kind: dKind,
+      xField: typeof rawDisplay.xField === 'string' ? rawDisplay.xField : undefined,
+      yField: typeof rawDisplay.yField === 'string' ? rawDisplay.yField : undefined,
+      seriesField: typeof rawDisplay.seriesField === 'string' ? rawDisplay.seriesField : undefined,
+      title: typeof rawDisplay.title === 'string' ? rawDisplay.title : undefined,
     },
-    explanation: typeof r!.explanation === 'string' ? r!.explanation : '',
-    warnings: Array.isArray(r!.warnings) ? r!.warnings : [],
+    explanation: typeof r!.explanation === 'string' && r!.explanation.length > 0
+      ? r!.explanation
+      : (turn.message || ''),
+    warnings: Array.isArray(r!.warnings) ? r!.warnings.filter((w: unknown): w is string => typeof w === 'string') : [],
   };
 
   // kind === 'report': validate + (optionally) execute.

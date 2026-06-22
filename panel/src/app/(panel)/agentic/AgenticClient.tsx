@@ -178,6 +178,12 @@ function ResultPanel({ report, execution, busy, onExecute }: {
       {execution?.ok && rows && rows.length === 0 && (
         <div className="surface p-4 text-sm text-muted">Query returned no rows.</div>
       )}
+
+      {!execution && (
+        <div className="surface p-4 text-sm text-muted">
+          Pipeline ready but not executed yet. Click <span className="font-medium text-ink">▶ Execute</span> above to run it.
+        </div>
+      )}
     </div>
   );
 }
