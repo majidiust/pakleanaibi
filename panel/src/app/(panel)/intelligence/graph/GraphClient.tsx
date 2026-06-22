@@ -1,127 +1,231 @@
 'use client';
 import Link from 'next/link';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import dynamic from 'next/dynamic';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { ComponentType, MutableRefObject } from 'react';
+import * as THREE from 'three';
+import SpriteText from 'three-spritetext';
 import { IntelTabs, PageHeader, TypeBadge } from '../_ui';
 
-interface Node { id: string; label: string; entity: string; description: string; tags: string[]; docCount: number; fieldsCount: number }
-interface Edge { id: string; source: string; target: string; sourceField: string; targetField: string; type: string; status: string; confidence: number; color?: string }
-interface Sim { id: string; x: number; y: number; vx: number; vy: number; fx?: number; fy?: number }
+// 3D force-directed graph with always-on text labels and a navigation
+// overlay. The previous implementation was a 2D SVG with a hand-rolled
+// Fruchterman-Reingold simulation; the codebase still keeps that pattern
+// for small static diagrams but for the schema graph the analyst benefits
+// from depth cues (clustered communities pop out of the screen) and from
+// camera controls (orbit, zoom, recenter).
+//
+// react-force-graph-3d wraps three.js + three-forcegraph. It must be loaded
+// dynamically with ssr:false because WebGL is browser-only.
+
+interface Node {
+  id: string; label: string; entity: string; description: string;
+  tags: string[]; docCount: number; fieldsCount: number;
+  // Coordinates injected by the simulation in-place. Optional because the
+  // initial fetch payload doesn't include them.
+  x?: number; y?: number; z?: number;
+}
+interface Edge {
+  id: string; source: string | Node; target: string | Node;
+  sourceField: string; targetField: string;
+  type: string; status: string; confidence: number; color?: string;
+}
+
+// Lib's ref shape — the subset of methods we actually call. Avoids dragging
+// the full ForceGraphMethods generic + its three.js scene types into this
+// file's public surface.
+interface FG3DRef {
+  cameraPosition(
+    pos?: { x?: number; y?: number; z?: number },
+    lookAt?: { x: number; y: number; z: number },
+    transitionMs?: number,
+  ): { x: number; y: number; z: number };
+  zoomToFit(durationMs?: number, paddingPx?: number, nodeFilter?: (n: Node) => boolean): void;
+  refresh(): void;
+}
+
+interface ForceGraph3DProps {
+  ref?: MutableRefObject<FG3DRef | undefined>;
+  graphData: { nodes: Node[]; links: Edge[] };
+  width: number; height: number;
+  backgroundColor: string;
+  nodeThreeObject: (n: Node) => THREE.Object3D;
+  nodeThreeObjectExtend?: boolean;
+  linkColor: (l: Edge) => string;
+  linkOpacity?: number;
+  linkWidth: (l: Edge) => number;
+  linkDirectionalArrowLength?: number;
+  linkDirectionalArrowRelPos?: number;
+  linkDirectionalParticles?: (l: Edge) => number;
+  linkDirectionalParticleSpeed?: number;
+  linkDirectionalParticleColor?: (l: Edge) => string;
+  onNodeClick?: (n: Node) => void;
+  onBackgroundClick?: () => void;
+  onEngineStop?: () => void;
+  cooldownTicks?: number;
+  warmupTicks?: number;
+  enableNodeDrag?: boolean;
+}
+
+// next/dynamic + react-force-graph-3d: the lib reaches for `window` at
+// import time, so it can only load in the browser.
+const ForceGraph3D = dynamic(
+  async () => (await import('react-force-graph-3d')).default,
+  { ssr: false, loading: () => <div className="text-muted text-sm p-4">Loading 3D engine…</div> },
+) as unknown as ComponentType<ForceGraph3DProps>;
 
 const STATUS_COLORS: Record<string, string> = {
   approved: '#22c55e', manual: '#7c5cff', suggested: '#f59e0b', rejected: '#475569', archived: '#475569',
 };
+
+// Per-entity node color so communities pop. Falls back to slate for nodes
+// without a tagged entity.
+const ENTITY_COLORS: Record<string, string> = {
+  identity: '#60a5fa', commerce: '#a78bfa', finance: '#34d399',
+  business: '#f59e0b', catalog: '#f472b6', telemetry: '#94a3b8',
+  auth: '#fb7185', stateful: '#22d3ee', timestamped: '#cbd5e1',
+};
+function nodeColor(n: Node, dim: boolean, sel: boolean): string {
+  if (sel) return '#7c5cff';
+  const c = ENTITY_COLORS[n.entity] ?? '#94a3b8';
+  return dim ? '#334155' : c;
+}
 
 export function GraphClient() {
   const [data, setData] = useState<{ nodes: Node[]; edges: Edge[] } | null>(null);
   const [statusFilter, setStatusFilter] = useState<'active' | 'suggested' | 'all'>('active');
   const [q, setQ] = useState('');
   const [selected, setSelected] = useState<string | null>(null);
-  const svgRef = useRef<SVGSVGElement | null>(null);
-  const simRef = useRef<Map<string, Sim>>(new Map());
-  const [, forceRender] = useState(0);
-  const [view, setView] = useState({ x: 0, y: 0, k: 1 });
-  const dragRef = useRef<{ id?: string; ox: number; oy: number; mode: 'pan' | 'node' } | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const fgRef = useRef<FG3DRef | undefined>(undefined);
+  const [size, setSize] = useState({ w: 800, h: 600 });
 
   useEffect(() => {
     fetch('/api/intel/graph?status=' + statusFilter).then(r => r.json()).then(setData);
   }, [statusFilter]);
 
-  // Build / refresh simulation on data change.
+  // Track container size so the 3D canvas adapts to layout changes (window
+  // resize, sidebar open/close, etc.). The ForceGraph3D component takes
+  // explicit width/height props, not flex/relative units.
   useEffect(() => {
-    if (!data) return;
-    const w = 1200, h = 800;
-    const map = simRef.current;
-    const used = new Set<string>();
-    data.nodes.forEach((n, i) => {
-      used.add(n.id);
-      if (!map.has(n.id)) {
-        const a = (i / data.nodes.length) * Math.PI * 2;
-        const r = 250 + Math.random() * 50;
-        map.set(n.id, { id: n.id, x: w / 2 + Math.cos(a) * r, y: h / 2 + Math.sin(a) * r, vx: 0, vy: 0 });
-      }
-    });
-    for (const k of [...map.keys()]) if (!used.has(k)) map.delete(k);
-    // Run a few hundred ticks synchronously so the initial layout settles.
-    runSimulation(data.nodes, data.edges, map, w, h, 250);
-    forceRender(x => x + 1);
-  }, [data]);
+    const el = containerRef.current;
+    if (!el) return;
+    const apply = () => {
+      const r = el.getBoundingClientRect();
+      setSize({ w: Math.max(320, Math.floor(r.width)), h: Math.max(360, Math.floor(r.height)) });
+    };
+    apply();
+    const ro = new ResizeObserver(apply);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
-  // Continuous animation when dragging or when user requests reheat.
-  useEffect(() => {
-    let raf = 0;
-    function tick() {
-      if (!data) return;
-      if (dragRef.current?.mode === 'node') {
-        runSimulation(data.nodes, data.edges, simRef.current, 1200, 800, 1);
-        forceRender(x => x + 1);
-      }
-      raf = requestAnimationFrame(tick);
-    }
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [data]);
-
-  const filteredEdges = useMemo(() => {
-    if (!data) return [];
-    return data.edges;
-  }, [data]);
-
-  const matches = useMemo(() => {
-    if (!q.trim() || !data) return new Set<string>();
+  // Match-highlight set. null when the search box is empty so the renderer
+  // can short-circuit and avoid dimming everything.
+  const matches = useMemo<Set<string> | null>(() => {
+    if (!q.trim() || !data) return null;
     const re = new RegExp(q.trim(), 'i');
     return new Set(data.nodes.filter(n => re.test(n.id) || re.test(n.label) || re.test(n.entity)).map(n => n.id));
   }, [q, data]);
 
-  function clientToSvg(e: React.PointerEvent) {
-    const svg = svgRef.current!;
-    const pt = svg.createSVGPoint();
-    pt.x = e.clientX; pt.y = e.clientY;
-    const ctm = svg.getScreenCTM()!;
-    const inv = ctm.inverse();
-    return pt.matrixTransform(inv);
-  }
+  // Adapt the API payload to the lib's expected `links` shape. We pass copies
+  // so the simulation can mutate x/y/z on the nodes without surprising React.
+  const graphData = useMemo(() => {
+    if (!data) return { nodes: [] as Node[], links: [] as Edge[] };
+    return {
+      nodes: data.nodes.map(n => ({ ...n })),
+      links: data.edges.map(e => ({ ...e })),
+    };
+  }, [data]);
 
-  function onPointerDown(e: React.PointerEvent, nodeId?: string) {
-    (e.target as Element).setPointerCapture(e.pointerId);
-    const p = clientToSvg(e);
+  // Build the per-node three.js object: a coloured sphere sized by docCount
+  // plus a SpriteText label that always faces the camera so the analyst can
+  // read every node id without hovering. Recomputed when the highlight set
+  // or selection changes (the engine calls this lazily on dirty nodes).
+  const nodeThreeObject = useCallback((node: Node) => {
+    const dim = !!(matches && !matches.has(node.id));
+    const sel = selected === node.id;
+    const r = 4 + Math.min(8, Math.log10(Math.max(1, node.docCount)) * 1.8);
+    const group = new THREE.Group();
+    const sphere = new THREE.Mesh(
+      new THREE.SphereGeometry(r, 18, 18),
+      new THREE.MeshLambertMaterial({
+        color: nodeColor(node, dim, sel),
+        opacity: dim ? 0.35 : 1,
+        transparent: true,
+      }),
+    );
+    group.add(sphere);
+    if (sel) {
+      // A faint halo around the selected node — easy visual anchor when the
+      // camera flies in from a wide view.
+      const halo = new THREE.Mesh(
+        new THREE.SphereGeometry(r * 1.45, 18, 18),
+        new THREE.MeshBasicMaterial({ color: '#7c5cff', opacity: 0.18, transparent: true }),
+      );
+      group.add(halo);
+    }
+    const label = new SpriteText(node.id);
+    label.color = sel ? '#ffffff' : dim ? '#475569' : '#e2e8f0';
+    label.backgroundColor = sel ? '#7c5cff' : 'rgba(15,15,18,0.7)';
+    label.padding = 1.4;
+    label.fontFace = 'ui-monospace, SFMono-Regular, Menlo, monospace';
+    label.fontWeight = sel ? '600' : '400';
+    label.textHeight = 3.2 + Math.min(2.8, Math.log10(Math.max(1, node.docCount)) * 0.9);
+    label.position.set(0, r + label.textHeight * 0.9, 0);
+    group.add(label);
+    return group;
+  }, [matches, selected]);
+
+  const linkColor = useCallback((l: Edge) => {
+    const base = STATUS_COLORS[l.status] ?? '#64748b';
+    if (!matches) return base;
+    const srcId = typeof l.source === 'string' ? l.source : l.source.id;
+    const tgtId = typeof l.target === 'string' ? l.target : l.target.id;
+    if (matches.has(srcId) || matches.has(tgtId)) return base;
+    return '#1f2937';
+  }, [matches]);
+  const linkWidth = useCallback((l: Edge) => l.status === 'manual' ? 2.2 : l.status === 'approved' ? 1.4 : 0.8, []);
+  // Animated particles along approved/manual links provide a subtle hint of
+  // join direction without the clutter of arrow heads in 3D.
+  const linkParticles = useCallback(
+    (l: Edge) => (l.status === 'manual' || l.status === 'approved') ? 2 : 0, []);
+
+  const recenter = useCallback((nodeId?: string) => {
+    const fg = fgRef.current; if (!fg) return;
     if (nodeId) {
-      const s = simRef.current.get(nodeId);
-      if (s) { s.fx = s.x; s.fy = s.y; }
-      dragRef.current = { id: nodeId, ox: p.x, oy: p.y, mode: 'node' };
+      const n = graphData.nodes.find(x => x.id === nodeId);
+      if (!n || n.x === undefined) return;
+      const dist = 120;
+      const ratio = 1 + dist / Math.max(1, Math.hypot(n.x, n.y ?? 0, n.z ?? 0));
+      fg.cameraPosition(
+        { x: (n.x ?? 0) * ratio, y: (n.y ?? 0) * ratio, z: (n.z ?? 0) * ratio },
+        { x: n.x ?? 0, y: n.y ?? 0, z: n.z ?? 0 },
+        700,
+      );
     } else {
-      dragRef.current = { ox: p.x, oy: p.y, mode: 'pan' };
+      fg.zoomToFit(700, 60);
     }
-  }
-  function onPointerMove(e: React.PointerEvent) {
-    if (!dragRef.current) return;
-    const p = clientToSvg(e);
-    if (dragRef.current.mode === 'node' && dragRef.current.id) {
-      const s = simRef.current.get(dragRef.current.id);
-      if (s) { s.fx = p.x; s.fy = p.y; s.x = p.x; s.y = p.y; }
-    } else {
-      setView(v => ({ ...v, x: v.x + (p.x - dragRef.current!.ox) * v.k, y: v.y + (p.y - dragRef.current!.oy) * v.k }));
-    }
-  }
-  function onPointerUp() {
-    if (dragRef.current?.id) {
-      const s = simRef.current.get(dragRef.current.id);
-      if (s) { s.fx = undefined; s.fy = undefined; }
-    }
-    dragRef.current = null;
-  }
-  function onWheel(e: React.WheelEvent) {
-    e.preventDefault();
-    const delta = e.deltaY < 0 ? 1.1 : 1 / 1.1;
-    setView(v => ({ ...v, k: Math.max(0.2, Math.min(3, v.k * delta)) }));
-  }
+  }, [graphData.nodes]);
+
+  // Multiplicative camera dolly — scale the camera's distance from the
+  // current lookAt origin without changing direction.
+  const dolly = useCallback((factor: number) => {
+    const fg = fgRef.current; if (!fg) return;
+    const p = fg.cameraPosition();
+    fg.cameraPosition({ x: p.x * factor, y: p.y * factor, z: p.z * factor }, undefined, 200);
+  }, []);
 
   if (!data) return <div><IntelTabs /><div className="card card-pad text-muted">Loading graph…</div></div>;
   const selectedNode = data.nodes.find(n => n.id === selected);
-  const selectedEdges = selected ? data.edges.filter(e => e.source === selected || e.target === selected) : [];
+  const selectedEdges = selected ? data.edges.filter(e => {
+    const s = typeof e.source === 'string' ? e.source : e.source.id;
+    const t = typeof e.target === 'string' ? e.target : e.target.id;
+    return s === selected || t === selected;
+  }) : [];
 
   return (
     <div>
-      <PageHeader title="Knowledge graph" subtitle="Interactive visual of inferred collections and relationships. Drag nodes, scroll to zoom." />
+      <PageHeader title="Knowledge graph" subtitle="3D view of inferred collections and relationships. Drag to orbit, scroll to zoom, right-drag to pan." />
       <IntelTabs />
       <div className="flex flex-wrap items-center gap-2 mb-3">
         <select className="input w-auto" value={statusFilter} onChange={e => setStatusFilter(e.target.value as 'active' | 'suggested' | 'all')}>
@@ -130,53 +234,57 @@ export function GraphClient() {
           <option value="all">All</option>
         </select>
         <input className="input flex-1 min-w-[200px] max-w-md" placeholder="Search collection / entity…" value={q} onChange={e => setQ(e.target.value)} />
-        <button className="btn-ghost text-sm" onClick={() => setView({ x: 0, y: 0, k: 1 })}>Reset view</button>
         <span className="text-xs text-muted">{data.nodes.length} nodes · {data.edges.length} edges</span>
       </div>
 
       <div className="grid lg:grid-cols-[1fr_320px] gap-3">
-        <div className="card overflow-hidden">
-          <svg ref={svgRef} viewBox="0 0 1200 800" className="w-full h-[640px] bg-panel2 select-none"
-               onPointerDown={e => onPointerDown(e)} onPointerMove={onPointerMove} onPointerUp={onPointerUp}
-               onWheel={onWheel}>
-            <defs>
-              {Object.entries(STATUS_COLORS).map(([k, c]) => (
-                <marker key={k} id={`arrow-${k}`} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-                  <path d="M0,0 L10,5 L0,10 z" fill={c} />
-                </marker>
-              ))}
-            </defs>
-            <g transform={`translate(${view.x},${view.y}) scale(${view.k})`}>
-              {filteredEdges.map(ed => {
-                const s = simRef.current.get(ed.source); const t = simRef.current.get(ed.target);
-                if (!s || !t) return null;
-                const dim = matches.size > 0 && !matches.has(ed.source) && !matches.has(ed.target);
-                const color = STATUS_COLORS[ed.status] ?? '#64748b';
-                return (
-                  <line key={ed.id} x1={s.x} y1={s.y} x2={t.x} y2={t.y}
-                        stroke={color} strokeOpacity={dim ? 0.1 : 0.6}
-                        strokeWidth={ed.status === 'manual' ? 2.4 : 1.4}
-                        strokeDasharray={ed.status === 'suggested' ? '4 3' : undefined}
-                        markerEnd={`url(#arrow-${ed.status})`} />
-                );
-              })}
-              {data.nodes.map(n => {
-                const s = simRef.current.get(n.id); if (!s) return null;
-                const dim = matches.size > 0 && !matches.has(n.id);
-                const sel = selected === n.id;
-                const r = 8 + Math.min(20, Math.log10(Math.max(1, n.docCount)) * 4);
-                return (
-                  <g key={n.id} transform={`translate(${s.x},${s.y})`} opacity={dim ? 0.25 : 1}
-                     onPointerDown={e => { e.stopPropagation(); onPointerDown(e, n.id); }}
-                     onClick={() => setSelected(n.id)} style={{ cursor: 'pointer' }}>
-                    <circle r={r} fill={sel ? '#7c5cff' : '#1e293b'} stroke={sel ? '#7c5cff' : '#475569'} strokeWidth={sel ? 2.4 : 1.2} />
-                    <text textAnchor="middle" dy={-r - 6} fill="#cbd5e1" fontSize={11} fontFamily="ui-monospace, monospace">{n.id}</text>
-                  </g>
-                );
-              })}
-            </g>
-          </svg>
+        <div className="card overflow-hidden relative">
+          <div ref={containerRef} className="w-full h-[calc(100vh-260px)] min-h-[520px] bg-panel2">
+            <ForceGraph3D
+              ref={fgRef as MutableRefObject<FG3DRef | undefined>}
+              graphData={graphData}
+              width={size.w}
+              height={size.h}
+              backgroundColor="#0a0a0c"
+              nodeThreeObject={nodeThreeObject}
+              linkColor={linkColor}
+              linkOpacity={0.55}
+              linkWidth={linkWidth}
+              linkDirectionalParticles={linkParticles}
+              linkDirectionalParticleSpeed={0.006}
+              linkDirectionalParticleColor={linkColor}
+              cooldownTicks={120}
+              warmupTicks={60}
+              enableNodeDrag
+              onNodeClick={n => { setSelected(n.id); recenter(n.id); }}
+              onBackgroundClick={() => setSelected(null)}
+              onEngineStop={() => { if (!selected) fgRef.current?.zoomToFit(600, 60); }}
+            />
+          </div>
+
+          {/* Navigation toolbar — absolute over the canvas so the layout
+              doesn't shift when buttons get added later. */}
+          <div className="absolute top-2 right-2 flex flex-col gap-1 bg-bg/70 backdrop-blur-sm border border-line rounded-lg p-1 shadow-lg">
+            <button type="button" className="btn-ghost text-sm px-2 py-1" title="Zoom in"        onClick={() => dolly(0.8)}>＋</button>
+            <button type="button" className="btn-ghost text-sm px-2 py-1" title="Zoom out"       onClick={() => dolly(1.25)}>−</button>
+            <button type="button" className="btn-ghost text-sm px-2 py-1" title="Fit all"        onClick={() => recenter()}>⤢</button>
+            <button type="button" className="btn-ghost text-sm px-2 py-1" title="Center selected" onClick={() => selected && recenter(selected)} disabled={!selected}>◎</button>
+            <button type="button" className="btn-ghost text-sm px-2 py-1" title="Top view"       onClick={() => fgRef.current?.cameraPosition({ x: 0, y: 700, z: 0.01 }, { x: 0, y: 0, z: 0 }, 700)}>⬒</button>
+            <button type="button" className="btn-ghost text-sm px-2 py-1" title="Front view"     onClick={() => fgRef.current?.cameraPosition({ x: 0, y: 0, z: 700 }, { x: 0, y: 0, z: 0 }, 700)}>◧</button>
+          </div>
+
+          {/* Legend pinned bottom-left so newcomers can decode the colours. */}
+          <div className="absolute bottom-2 left-2 bg-bg/70 backdrop-blur-sm border border-line rounded-lg px-2 py-1.5 text-2xs space-y-0.5">
+            <div className="text-muted-2 mb-0.5">Link status</div>
+            {Object.entries(STATUS_COLORS).map(([k, c]) => (
+              <div key={k} className="flex items-center gap-1.5">
+                <span className="inline-block w-3 h-0.5 rounded" style={{ background: c }} />
+                <span className="text-muted">{k}</span>
+              </div>
+            ))}
+          </div>
         </div>
+
         <div className="card card-pad">
           {!selectedNode && <div className="text-sm text-muted">Click a node to see details.</div>}
           {selectedNode && (
@@ -194,8 +302,10 @@ export function GraphClient() {
                 <div className="text-xs text-muted mb-1">{selectedEdges.length} connections</div>
                 <div className="space-y-1 max-h-72 overflow-y-auto pr-1">
                   {selectedEdges.map(e => {
-                    const other = e.source === selected ? e.target : e.source;
-                    const dir = e.source === selected ? '→' : '←';
+                    const s = typeof e.source === 'string' ? e.source : e.source.id;
+                    const t = typeof e.target === 'string' ? e.target : e.target.id;
+                    const other = s === selected ? t : s;
+                    const dir = s === selected ? '→' : '←';
                     return (
                       <div key={e.id} className="text-xs flex items-center gap-2">
                         <span className="text-muted">{dir}</span>
@@ -212,49 +322,4 @@ export function GraphClient() {
       </div>
     </div>
   );
-}
-
-// Simple Fruchterman-Reingold-ish force layout. Repulsion between all nodes,
-// attraction along edges, gentle centering force.
-function runSimulation(nodes: Node[], edges: Edge[], pos: Map<string, Sim>, w: number, h: number, iters: number) {
-  const k = 90;            // ideal edge length
-  const damp = 0.85;
-  const center = { x: w / 2, y: h / 2 };
-  const arr = nodes.map(n => pos.get(n.id)!).filter(Boolean);
-  for (let it = 0; it < iters; it++) {
-    for (const a of arr) { a.vx *= damp; a.vy *= damp; }
-    // Repulsion (O(n^2) — fine for small/medium graphs).
-    for (let i = 0; i < arr.length; i++) {
-      for (let j = i + 1; j < arr.length; j++) {
-        const a = arr[i], b = arr[j];
-        let dx = a.x - b.x, dy = a.y - b.y;
-        let d2 = dx * dx + dy * dy;
-        if (d2 < 1) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d2 = 1; }
-        const f = (k * k) / d2;
-        const d = Math.sqrt(d2);
-        a.vx += (dx / d) * f * 0.02; a.vy += (dy / d) * f * 0.02;
-        b.vx -= (dx / d) * f * 0.02; b.vy -= (dy / d) * f * 0.02;
-      }
-    }
-    // Attraction along edges.
-    for (const e of edges) {
-      const a = pos.get(e.source), b = pos.get(e.target);
-      if (!a || !b) continue;
-      const dx = a.x - b.x, dy = a.y - b.y;
-      const d = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-      const f = (d * d) / k;
-      a.vx -= (dx / d) * f * 0.02; a.vy -= (dy / d) * f * 0.02;
-      b.vx += (dx / d) * f * 0.02; b.vy += (dy / d) * f * 0.02;
-    }
-    // Gentle centering.
-    for (const a of arr) {
-      a.vx += (center.x - a.x) * 0.001;
-      a.vy += (center.y - a.y) * 0.001;
-    }
-    // Integrate; honour fixed pin.
-    for (const a of arr) {
-      if (a.fx !== undefined && a.fy !== undefined) { a.x = a.fx; a.y = a.fy; continue; }
-      a.x += a.vx; a.y += a.vy;
-    }
-  }
 }
