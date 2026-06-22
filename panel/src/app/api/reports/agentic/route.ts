@@ -16,9 +16,13 @@ export const dynamic = 'force-dynamic';
 // quickly. The route trims to a sliding window before calling the LLM, so
 // these caps only exist to reject obviously malformed payloads.
 const Body = z.object({
+  // Allow empty content here: assistant turns that were pure-report (the LLM
+  // put everything in report.explanation and left `message` blank) ended up
+  // stored client-side with content=''. Rejecting them would brick those
+  // existing sessions. We filter empties out before calling the LLM below.
   history: z.array(z.object({
     role: z.enum(['user', 'assistant']),
-    content: z.string().min(1).max(16000),
+    content: z.string().max(16000),
   })).min(1).max(200),
   lastReport: z.object({
     collection: z.string(),
@@ -185,12 +189,23 @@ export async function POST(req: Request) {
   }
 
   const { history, lastReport, execute = true, maxRepairs = 2 } = parsed.data;
+  // Drop empty/whitespace-only entries before the LLM sees them. Pure-report
+  // assistant turns previously persisted with content='' on the client; those
+  // shouldn't count as conversation. After filtering we must still have a
+  // user turn to act on, otherwise there's nothing to answer.
+  const cleaned = history.filter(m => m.content.trim().length > 0);
+  if (cleaned.length === 0 || !cleaned.some(m => m.role === 'user')) {
+    return NextResponse.json({
+      error: 'invalid_body',
+      message: 'history must contain at least one non-empty user message',
+    }, { status: 400 });
+  }
   const [digest, serverInfo] = await Promise.all([getSchema(false), getServerInfo()]);
   const version: [number, number] = [serverInfo.major, serverInfo.minor];
   // Sliding window: drop everything but the most recent N turns. The LLM
   // doesn't need ancient context, and trimming here keeps the prompt small
   // even when the client forgets to do so.
-  const trimmed = history.length > HISTORY_WINDOW ? history.slice(-HISTORY_WINDOW) : history;
+  const trimmed = cleaned.length > HISTORY_WINDOW ? cleaned.slice(-HISTORY_WINDOW) : cleaned;
   const history2: ChatMessage[] = trimmed.map(m => ({ role: m.role, content: m.content }));
   const db = await dataDb();
 

@@ -57,13 +57,19 @@ export function AgenticClient() {
     try {
       // Send only the recent slice of the conversation. The server applies
       // its own window too, but trimming here keeps payloads small and
-      // avoids tripping the body validator after long sessions.
-      const recent = nextHist.slice(-24).map(m => ({
-        role: m.role,
-        // Defensive cap: long pasted errors or huge plan blocks could push a
-        // single message over the server's per-message limit.
-        content: m.content.length > 8000 ? m.content.slice(0, 8000) + '…' : m.content,
-      }));
+      // avoids tripping the body validator after long sessions. Drop any
+      // empty/whitespace-only entries — older sessions may contain pure-
+      // report assistant turns that were stored with content=''.
+      const recent = nextHist
+        .map(m => ({ role: m.role, content: m.content.trim() }))
+        .filter(m => m.content.length > 0)
+        .slice(-24)
+        .map(m => ({
+          role: m.role,
+          // Defensive cap: long pasted errors or huge plan blocks could push a
+          // single message over the server's per-message limit.
+          content: m.content.length > 8000 ? m.content.slice(0, 8000) + '…' : m.content,
+        }));
       const r = await fetch('/api/reports/agentic', {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -76,13 +82,20 @@ export function AgenticClient() {
       if (!r.ok) { setErr(j.message ?? j.error ?? 'request failed'); setBusy(null); return; }
       // Build the post-turn chat: the initial assistant turn, then one
       // bubble per auto-repair attempt so the user can follow what the
-      // agent did to recover from each execution failure.
-      const appended: ChatMsg[] = [{ role: 'assistant', content: j.message, kind: j.kind }];
+      // agent did to recover from each execution failure. Always store
+      // *some* content so the bubble survives the next-turn validation —
+      // a pure-report turn often has an empty `message`, in which case
+      // the report's own explanation is the most useful thing to keep.
+      const primaryContent = (j.message?.trim()
+        || j.report?.explanation?.trim()
+        || (j.kind === 'report' ? '(produced a report)' : '(no message)'));
+      const appended: ChatMsg[] = [{ role: 'assistant', content: primaryContent, kind: j.kind }];
       for (const rep of j.repairs ?? []) {
         const verdict = rep.execution.ok
           ? ` ✓ (${rep.execution.count ?? rep.execution.rows?.length ?? 0} rows)`
           : ` ✗ (${rep.execution.error ?? 'failed'})`;
-        appended.push({ role: 'assistant', content: rep.message + verdict, kind: 'repair' });
+        const repMsg = (rep.message?.trim() || rep.report?.explanation?.trim() || '(repair attempt)');
+        appended.push({ role: 'assistant', content: repMsg + verdict, kind: 'repair' });
       }
       setHistory(h => [...h, ...appended]);
       if (j.kind === 'report' && j.report) {
