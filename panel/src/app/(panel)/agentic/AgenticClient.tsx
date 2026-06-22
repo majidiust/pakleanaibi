@@ -70,9 +70,17 @@ export function AgenticClient() {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ collection: report.collection, pipeline: report.pipeline }),
       });
-      const j = await r.json();
-      if (!r.ok) { setExecution({ ok: false, error: j.message ?? j.error ?? 'execution failed' }); return; }
-      setExecution({ ok: true, rows: j.rows, took: j.took, count: j.count, truncated: j.truncated });
+      let j: { rows?: Record<string, unknown>[]; took?: number; count?: number; truncated?: boolean; error?: string; message?: string } = {};
+      try { j = await r.json(); } catch { /* non-JSON response */ }
+      if (!r.ok) {
+        setExecution({ ok: false, error: j.message ?? j.error ?? `HTTP ${r.status}` });
+        return;
+      }
+      setExecution({ ok: true, rows: j.rows ?? [], took: j.took, count: j.count ?? (j.rows?.length ?? 0), truncated: j.truncated });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setExecution({ ok: false, error: 'request_failed: ' + msg });
+      setErr('Execute failed: ' + msg);
     } finally { setBusy(null); }
   }, [report, busy]);
 
