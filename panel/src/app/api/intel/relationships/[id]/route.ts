@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { requireRole } from '@/lib/auth';
 import { intelRels, audit, oid } from '@/lib/intel/storage';
 import { recordApproval, recordRejection } from '@/lib/intel/learn';
+import { invalidateSchemaCache } from '@/lib/schema';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -40,6 +41,7 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
   }
   await rels.updateOne({ _id }, { $set: update });
   await audit(me.sub, `relationship.${parsed.data.status ?? 'update'}`, existing.fingerprint, parsed.data);
+  await invalidateSchemaCache();
   return NextResponse.json({ ok: true });
 }
 
@@ -53,5 +55,6 @@ export async function DELETE(_req: Request, { params }: { params: { id: string }
   if (!existing) return NextResponse.json({ error: 'not_found' }, { status: 404 });
   await rels.deleteOne({ _id });
   await audit(me.sub, 'relationship.delete', existing.fingerprint);
+  await invalidateSchemaCache();
   return NextResponse.json({ ok: true });
 }

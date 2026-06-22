@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { requireRole } from '@/lib/auth';
 import { intelColl, intelRels, audit } from '@/lib/intel/storage';
 import { relFingerprint } from '@/lib/intel';
+import { invalidateSchemaCache } from '@/lib/schema';
 import type { IntelRelationship } from '@/lib/intel/types';
 
 export const runtime = 'nodejs';
@@ -86,10 +87,12 @@ export async function POST(req: Request, { params }: { params: { name: string } 
       },
     );
     await audit(me.sub, 'relationship.approve_via_ai', fp);
+    await invalidateSchemaCache();
     return NextResponse.json({ ok: true, fingerprint: fp, upgraded: true });
   }
 
   const r = await rels.insertOne(doc);
   await audit(me.sub, 'relationship.create_via_ai', fp);
+  await invalidateSchemaCache();
   return NextResponse.json({ ok: true, fingerprint: fp, id: String(r.insertedId) }, { status: 201 });
 }

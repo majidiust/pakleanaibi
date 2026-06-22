@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { requireRole } from '@/lib/auth';
 import { intelColl, intelRels, audit } from '@/lib/intel/storage';
 import { relFingerprint } from '@/lib/intel';
+import { invalidateSchemaCache } from '@/lib/schema';
 import type { IntelRelationship } from '@/lib/intel/types';
 
 export const runtime = 'nodejs';
@@ -84,5 +85,6 @@ export async function POST(req: Request) {
   }
 
   await audit(me.sub, 'import', undefined, { collUpdated, relAdded, relUpdated });
+  if (relAdded > 0 || relUpdated > 0) await invalidateSchemaCache();
   return NextResponse.json({ ok: true, collUpdated, relAdded, relUpdated });
 }

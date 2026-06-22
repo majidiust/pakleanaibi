@@ -99,6 +99,17 @@ export async function getSchema(force = false): Promise<SchemaDigest> {
   return digest;
 }
 
+// Drops the cached digest so the next getSchema() call resamples and picks up
+// freshly-added/edited/removed relationships. Called from the intel
+// relationship mutation routes so analysts don't have to wait out the 30-min
+// TTL to see new JOIN RECIPES surface in the agentic prompt.
+export async function invalidateSchemaCache(): Promise<void> {
+  try {
+    const bi = await biDb();
+    await bi.collection('schema_cache').deleteOne({ key: 'data' });
+  } catch { /* best-effort */ }
+}
+
 // Compact text form used inside the LLM system prompt. We list collections
 // with their fields and -- crucially -- a JOIN RECIPES section that spells
 // out ready-to-paste $lookup stages in BOTH directions for every
@@ -139,6 +150,53 @@ export function schemaToPrompt(s: SchemaDigest): string {
         `    { "$lookup": { "from": "${r.source.collection}", "localField": "${tgtKey}", "foreignField": "${r.source.field}", "as": "${r.source.collection}_joined" } }`,
       );
     }
+    // Multi-hop chain recipes. When the user asks for a field that lives two
+    // collections away from the natural anchor (classic case: "items of the
+    // last order with the item NAME" -- name is in `items`, not `orderitems`),
+    // the model often stops at the first $lookup. Emitting full chain
+    // templates (anchor -> $lookup -> $unwind -> $lookup) tells it the exact
+    // sequence of stages required to surface fields on the far side.
+    const chains = buildChains(rels);
+    if (chains.length) {
+      lines.push('', 'CHAINED JOIN RECIPES (use when a requested field is two hops away from the anchor):');
+      for (const c of chains) lines.push(c);
+    }
   }
   return lines.join('\n');
+}
+
+interface Edge { from: string; fromField: string; to: string; toField: string }
+
+// Walks all approved/manual relationships and emits human-readable templates
+// for every 2-hop path A -> B -> C (and its reverse). Each template includes
+// the exact $lookup / $unwind / $lookup sequence so the agent has nothing
+// left to invent when chaining joins.
+function buildChains(rels: KnownRelationship[]): string[] {
+  const edges: Edge[] = [];
+  for (const r of rels) {
+    const toField = r.target.matchOn ?? r.target.field;
+    edges.push({ from: r.source.collection, fromField: r.source.field, to: r.target.collection, toField });
+    edges.push({ from: r.target.collection, fromField: toField, to: r.source.collection, toField: r.source.field });
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const e1 of edges) {
+    for (const e2 of edges) {
+      if (e1.to !== e2.from) continue;
+      if (e1.from === e2.to) continue; // skip A->B->A loops
+      const key = `${e1.from}|${e1.fromField}|${e1.to}|${e2.to}|${e2.toField}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const midAs = `${e1.to}_joined`;
+      const farAs = `${e2.to}_joined`;
+      out.push(
+        `- Anchor in "${e1.from}" -> attach "${e1.to}" -> attach "${e2.to}" (use when a field on "${e2.to}" is requested):\n` +
+        `    { "$lookup": { "from": "${e1.to}", "localField": "${e1.fromField}", "foreignField": "${e1.toField}", "as": "${midAs}" } }\n` +
+        `    { "$unwind": { "path": "$${midAs}", "preserveNullAndEmptyArrays": true } }\n` +
+        `    { "$lookup": { "from": "${e2.to}", "localField": "${midAs}.${e2.fromField}", "foreignField": "${e2.toField}", "as": "${farAs}" } }\n` +
+        `    { "$unwind": { "path": "$${farAs}", "preserveNullAndEmptyArrays": true } }`,
+      );
+    }
+  }
+  return out;
 }

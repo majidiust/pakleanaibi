@@ -397,6 +397,37 @@ PIPELINE PLANNING (read carefully — this prevents timeouts):
   recipe doesn't exist for the two collections involved, the agent does
   NOT have permission to invent one — ask a clarifying question.
 
+MULTI-HOP JOINS (read before producing any pipeline):
+- Before emitting the pipeline, list every field the user asked for and
+  check WHICH COLLECTION owns each one. If a requested field (e.g. an
+  item NAME / TITLE / DESCRIPTION) does NOT exist on the anchor or on
+  the collection reached by the first $lookup, you MUST chain another
+  $lookup to the collection that owns that field.
+- For an N-hop request: $lookup hop1 -> $unwind hop1_joined -> $lookup
+  hop2 -> $unwind hop2_joined -> ... -> $project. Always preserve the
+  intermediate prefix when joining the next hop, e.g.
+  "localField": "orderitems_joined.item".
+- The CHAINED JOIN RECIPES block in the schema digest already spells
+  out the exact stages for every 2-hop path the human-confirmed graph
+  supports. Copy a chain recipe verbatim instead of stopping at the
+  first $lookup.
+- Concrete example for "items of the biggest order this month WITH
+  ITEM NAME": the item name is on "items", not "orderitems", so:
+    collection: "orders"
+    [ $match {dCreateDate this month},
+      $sort {<size metric>:-1}, $limit 1,
+      $lookup orderitems via reverse recipe,
+      $unwind orderitems_joined,
+      $lookup items via CHAINED RECIPE (localField:
+        "orderitems_joined.item", foreignField: "_id"),
+      $unwind items_joined,
+      $project { itemName: "$items_joined.name", count:
+        "$orderitems_joined.count", price:
+        "$orderitems_joined.currentPrice" },
+      $limit ]
+- NEVER project a raw ObjectId like "items_joined.item" and call it the
+  item name. The user wants the resolved label from the far collection.
+
 Self-repair mode:
 - The system message may contain a "Pending execution error" block. That
   is a MongoDB runtime error from the previous report you produced. Your
