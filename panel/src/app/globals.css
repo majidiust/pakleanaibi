@@ -134,10 +134,14 @@ body {
   /* ---------- Tables ---------- */
   .table-wrap { @apply overflow-x-auto rounded-xl border border-line bg-panel; }
   table.bi { @apply w-full text-sm border-collapse; }
+  /* NOTE: avoid backdrop-filter on the sticky thead -- combining it with
+     horizontal scroll inside .table-wrap and opacity transitions on the
+     parent causes severe paint tearing/flicker in Chromium. Use a solid
+     background instead. */
   table.bi thead th {
     @apply text-left text-2xs uppercase tracking-[0.08em] text-muted font-semibold
-           bg-panel2/80 border-b border-line px-3 py-2.5 select-none whitespace-nowrap;
-    position: sticky; top: 0; z-index: 1; backdrop-filter: blur(6px);
+           bg-panel2 border-b border-line px-3 py-2.5 select-none whitespace-nowrap;
+    position: sticky; top: 0; z-index: 1;
   }
   table.bi tbody td {
     @apply px-3 py-2 border-b border-line/60 align-top text-ink-2;

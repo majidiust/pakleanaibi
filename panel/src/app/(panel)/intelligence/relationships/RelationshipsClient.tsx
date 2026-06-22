@@ -136,14 +136,17 @@ export function RelationshipsClient({ role }: { role: string }) {
       {creating && <NewRelationshipForm onClose={() => setCreating(false)} onCreated={() => { setCreating(false); void load(); }} />}
 
       <div className="card">
-        <div className={`table-wrap rounded-b-none transition-opacity duration-150 ${refreshing ? 'opacity-70' : 'opacity-100'}`}>
+        <div className="table-wrap rounded-b-none">
           <table className="bi">
             <thead><tr>
               <th>Source</th><th></th><th>Target</th>
               <th>Type</th><th>Status</th><th>Confidence</th>
               <th>Reason</th><th></th>
             </tr></thead>
-            <tbody>
+            {/* Dim only the tbody during refresh; transitioning opacity on the
+                wrap puts the sticky thead on its own compositing layer and
+                causes paint tearing during scroll. */}
+            <tbody className={refreshing ? 'opacity-70' : ''}>
               {loading && <tr><td colSpan={8} className="text-muted text-center py-6">Loading…</td></tr>}
               {!loading && list.length === 0 && (
                 <tr><td colSpan={8} className="text-muted text-center py-6">No relationships match the current filters.</td></tr>
