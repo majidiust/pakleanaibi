@@ -3,8 +3,8 @@ import { z } from 'zod';
 import { requireRole } from '@/lib/auth';
 import { getSchema } from '@/lib/schema';
 import { generateReport, repairReport, type LlmReport } from '@/lib/llm';
-import { validatePipeline } from '@/lib/pipeline-guard';
-import { dataDb } from '@/lib/mongo';
+import { validatePipeline, lowerPipeline } from '@/lib/pipeline-guard';
+import { dataDb, getServerInfo } from '@/lib/mongo';
 import { env } from '@/lib/env';
 import { lookup as cacheLookup, store as cacheStore } from '@/lib/cache';
 
@@ -55,6 +55,8 @@ export async function POST(req: Request) {
 
   const attempts: Attempt[] = [];
   const db = await dataDb();
+  const info = await getServerInfo();
+  const version: [number, number] = [info.major, info.minor];
 
   for (let i = 1; i <= maxAttempts; i++) {
     // Validate (sanitizes keys, enforces allowlist, forces final $limit).
@@ -80,11 +82,29 @@ export async function POST(req: Request) {
       continue;
     }
 
+    // Lower modern date operators for the target server version.
+    let lowered;
+    try { lowered = lowerPipeline(validated.pipeline, version); }
+    catch (e) {
+      const msg = 'unsupported_operator: ' + (e instanceof Error ? e.message : String(e));
+      attempts.push({
+        n: i, source,
+        collection: validated.collection, pipeline: validated.pipeline,
+        display: report.display, explanation: report.explanation,
+        warnings: report.warnings ?? [], ok: false, error: msg,
+        cache: i === 1 ? cacheInfo : null,
+      });
+      if (i >= maxAttempts) break;
+      report = await repairReport({ question, previous: report, error: msg }, digest);
+      source = 'repair';
+      continue;
+    }
+
     // Execute.
     const t0 = Date.now();
     try {
       const rows = await db.collection(validated.collection)
-        .aggregate(validated.pipeline, { maxTimeMS: env.REPORT_MAX_TIME_MS, allowDiskUse: false })
+        .aggregate(lowered, { maxTimeMS: env.REPORT_MAX_TIME_MS, allowDiskUse: false })
         .toArray();
       const took = Date.now() - t0;
       attempts.push({

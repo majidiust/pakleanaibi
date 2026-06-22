@@ -361,7 +361,10 @@ Constraints on report output (when kind="report"):
 - Forbidden: $out, $merge, $function, $accumulator, $where, evaluation
   operators. No JavaScript strings.
 - Always include an explicit final $limit (<= max rows).
-- Use ISO date math via $dateFromString / $dateTrunc when grouping by time.
+- For time-based filters and groupings, ALWAYS respect the "Target MongoDB
+  server" capability block below — older servers do not have $dateSubtract,
+  $dateTrunc, $$NOW, etc. Prefer literal ISO date strings for cutoffs and
+  $dateToString format codes for time buckets when in doubt.
 - Pick a display.kind that matches the shape ("bar" / "line" / "pie" /
   "area" / "table") with appropriate xField / yField.
 
@@ -379,7 +382,12 @@ Self-repair mode:
       $max/$push/$addToSet inside $group; no leading whitespace on $ops.
     * Type mismatch → wrap with $toDate, $toInt, $toString, etc.
     * $lookup join key mismatch → align ObjectId vs string types.
-    * Date math → use $dateSubtract / $dateTrunc / $dateFromString.
+    * Date math → pick operators allowed by the target server version
+      (see capability block). On 3.x/4.0 use literal ISO date strings
+      and $dateToString format codes; on 5.0+ $dateSubtract/$dateTrunc.
+    * "unsupported_operator: …" / "Unrecognized expression …" → the
+      operator does not exist on this server version — rewrite using
+      the alternatives listed in the capability block.
 - In "message" briefly explain (one sentence) what was changed and why.
 
 Language:
@@ -424,12 +432,29 @@ export interface AgenticContext {
   history: ChatMessage[];
   lastReport?: LlmReport | null;
   pendingError?: string | null;
+  serverVersion?: { major: number; minor: number; raw: string } | null;
+}
+
+// Per-version capability hints injected as a system message so the model
+// avoids operators the target server cannot evaluate. Keep this terse;
+// the validator/lowering layer is the source of truth.
+function versionCapsBlock(v?: { major: number; minor: number; raw: string } | null): string {
+  if (!v) return '';
+  const ge = (M: number, m: number) => v.major > M || (v.major === M && v.minor >= m);
+  const lines: string[] = [`Target MongoDB server: ${v.raw} (treat as ${v.major}.${v.minor}).`];
+  if (!ge(4, 2)) lines.push('- $$NOW and $$CLUSTER_TIME are NOT available. For "last N days" filters use a literal ISO date placeholder like "2024-01-01T00:00:00Z" — the server will substitute the current date at run time.');
+  if (!ge(5, 0)) lines.push('- $dateSubtract, $dateAdd, $dateDiff, $dateTrunc are NOT available. For date math, use literal ISO date values; for time bucketing use $dateToString with format strings (e.g. "%Y-%m" for monthly, "%Y-%m-%d" for daily).');
+  if (!ge(4, 0)) lines.push('- $lookup with "let"+"pipeline" syntax is NOT available; use the simple localField/foreignField form.');
+  if (!ge(3, 6)) lines.push('- $expr is NOT available.');
+  lines.push('- Always put $dateSubtract/$dateAdd inside $expr if used in $match. Otherwise prefer a literal ISO date for the cutoff.');
+  return lines.join('\n');
 }
 
 export async function agenticReport(ctx: AgenticContext, digest: SchemaDigest): Promise<AgenticTurn> {
   const c = client();
   const sysCtx = [
     `Max rows: ${env.REPORT_MAX_ROWS}.`,
+    versionCapsBlock(ctx.serverVersion),
     `Schema digest:\n${schemaToPrompt(digest)}`,
     ctx.lastReport
       ? `Previous report (you may revise this if the user asks):\n${JSON.stringify(ctx.lastReport, null, 2)}`

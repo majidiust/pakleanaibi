@@ -14,6 +14,18 @@ const FORBIDDEN_OPERATORS = new Set([
   '$planCacheStats', '$currentOp', '$changeStream',
 ]);
 
+// Operators that exist only on specific MongoDB versions. When the target
+// server is older than the minimum, the lowering pass tries to rewrite the
+// expression into something the server can evaluate; if it can't, validation
+// throws so the agentic self-repair loop sees a clear error.
+const MIN_VERSION: Record<string, [number, number]> = {
+  $dateSubtract: [5, 0],
+  $dateAdd: [5, 0],
+  $dateDiff: [5, 0],
+  $dateTrunc: [5, 0],
+  // $$NOW / $$CLUSTER_TIME (variables, not operators) are 4.2+; handled in lower().
+};
+
 export interface ValidatedPipeline {
   collection: string;
   pipeline: Record<string, unknown>[];
@@ -91,4 +103,121 @@ export function validatePipeline(input: {
   }
 
   return { collection: input.collection, pipeline: out };
+}
+
+// --- Server-version aware lowering ----------------------------------------
+// The LLM is asked to produce pipelines compatible with the target server,
+// but legacy databases (e.g. 3.4) don't have $$NOW or $dateSubtract. We
+// rewrite a small set of common time-math idioms into pre-computed literals
+// so the same pipeline can run on legacy servers. Anything we can't lower
+// throws, so the agentic self-repair loop receives a clear, actionable
+// error instead of MongoDB silently returning 0 rows.
+
+const UNIT_MS: Record<string, number> = {
+  millisecond: 1, milliseconds: 1,
+  second: 1000, seconds: 1000,
+  minute: 60_000, minutes: 60_000,
+  hour: 3_600_000, hours: 3_600_000,
+  day: 86_400_000, days: 86_400_000,
+  week: 7 * 86_400_000, weeks: 7 * 86_400_000,
+};
+
+function resolveLiteralDate(expr: unknown, now: Date): Date | null {
+  if (expr instanceof Date) return expr;
+  if (expr === '$$NOW' || expr === '$$CLUSTER_TIME') return now;
+  if (typeof expr === 'string' && /^\d{4}-\d{2}-\d{2}/.test(expr)) {
+    const d = new Date(expr);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  if (expr && typeof expr === 'object' && !Array.isArray(expr)) {
+    const o = expr as Record<string, unknown>;
+    if (o.$literal instanceof Date) return o.$literal;
+    if (o.$date) {
+      const d = new Date(o.$date as string | number);
+      return Number.isNaN(d.getTime()) ? null : d;
+    }
+    if (o.$dateFromString && typeof o.$dateFromString === 'object') {
+      const inner = (o.$dateFromString as { dateString?: unknown }).dateString;
+      if (typeof inner === 'string') {
+        const d = new Date(inner);
+        return Number.isNaN(d.getTime()) ? null : d;
+      }
+    }
+    if (o.$dateSubtract || o.$dateAdd) return resolveDateArithmetic(o, now);
+  }
+  return null;
+}
+
+function resolveDateArithmetic(
+  node: Record<string, unknown>,
+  now: Date,
+): Date | null {
+  const isSub = '$dateSubtract' in node;
+  const spec = (node.$dateSubtract ?? node.$dateAdd) as Record<string, unknown> | undefined;
+  if (!spec || typeof spec !== 'object') return null;
+  const base = resolveLiteralDate(spec.startDate, now);
+  const unit = String(spec.unit ?? '').toLowerCase();
+  const amount = Number(spec.amount);
+  const ms = UNIT_MS[unit];
+  if (!base || !ms || !Number.isFinite(amount)) return null;
+  return new Date(base.getTime() + (isSub ? -1 : 1) * amount * ms);
+}
+
+// Walks the pipeline; whenever it finds an operator that is unsupported on
+// the running server it tries to lower it. Returns the rewritten pipeline.
+// `version`: [major, minor] tuple, e.g. [3, 4].
+export function lowerPipeline(
+  pipeline: Record<string, unknown>[],
+  version: [number, number],
+): Record<string, unknown>[] {
+  const now = new Date();
+  function supports(op: string): boolean {
+    const min = MIN_VERSION[op];
+    if (!min) return true;
+    return version[0] > min[0] || (version[0] === min[0] && version[1] >= min[1]);
+  }
+  function walk(node: unknown): unknown {
+    if (node === null || typeof node !== 'object') {
+      if (node === '$$NOW' || node === '$$CLUSTER_TIME') {
+        // 4.2+ variable; on older servers, freeze to wall-clock at submit time.
+        if (version[0] > 4 || (version[0] === 4 && version[1] >= 2)) return node;
+        return now;
+      }
+      return node;
+    }
+    if (node instanceof Date) return node;
+    if (Array.isArray(node)) return node.map(walk);
+    const o = node as Record<string, unknown>;
+    // Lower $dateSubtract / $dateAdd if not supported.
+    for (const op of ['$dateSubtract', '$dateAdd'] as const) {
+      if (op in o && !supports(op)) {
+        const lit = resolveDateArithmetic(o, now);
+        if (!lit) {
+          throw new Error(
+            `${op} on MongoDB ${version.join('.')} requires a literal startDate; ` +
+            `use ISO date strings or omit time math.`,
+          );
+        }
+        // Replace the whole object with the literal Date so the parent expr
+        // sees a concrete value (e.g. inside $match.$gte).
+        return lit;
+      }
+    }
+    if ('$dateTrunc' in o && !supports('$dateTrunc')) {
+      throw new Error(
+        `$dateTrunc is unsupported on MongoDB ${version.join('.')}; ` +
+        `use $dateToString with format strings for time bucketing.`,
+      );
+    }
+    if ('$dateDiff' in o && !supports('$dateDiff')) {
+      throw new Error(
+        `$dateDiff is unsupported on MongoDB ${version.join('.')}; ` +
+        `compute differences with $subtract on dates instead.`,
+      );
+    }
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(o)) out[k] = walk(v);
+    return out;
+  }
+  return pipeline.map(stage => walk(stage) as Record<string, unknown>);
 }

@@ -1,8 +1,8 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireRole } from '@/lib/auth';
-import { dataDb } from '@/lib/mongo';
-import { validatePipeline } from '@/lib/pipeline-guard';
+import { dataDb, getServerInfo } from '@/lib/mongo';
+import { validatePipeline, lowerPipeline } from '@/lib/pipeline-guard';
 import { env } from '@/lib/env';
 
 export const runtime = 'nodejs';
@@ -27,11 +27,21 @@ export async function POST(req: Request) {
     }, { status: 422 });
   }
 
+  const info = await getServerInfo();
+  let pipeline;
+  try { pipeline = lowerPipeline(v.pipeline, [info.major, info.minor]); }
+  catch (e) {
+    return NextResponse.json({
+      error: 'unsupported_operator',
+      message: e instanceof Error ? e.message : String(e),
+    }, { status: 422 });
+  }
+
   const db = await dataDb();
   const t0 = Date.now();
   try {
     const rows = await db.collection(v.collection)
-      .aggregate(v.pipeline, { maxTimeMS: env.REPORT_MAX_TIME_MS, allowDiskUse: false })
+      .aggregate(pipeline, { maxTimeMS: env.REPORT_MAX_TIME_MS, allowDiskUse: false })
       .toArray();
     return NextResponse.json({
       rows,

@@ -1,7 +1,18 @@
 'use client';
 import Link from 'next/link';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { IntelTabs, PageHeader, Confidence, StatusBadge, TypeBadge } from '../_ui';
+
+// Tracks any value through a short window so high-frequency inputs
+// (text search, range slider) don't refetch on every keystroke.
+function useDebounced<T>(value: T, delayMs = 300): T {
+  const [v, setV] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setV(value), delayMs);
+    return () => clearTimeout(t);
+  }, [value, delayMs]);
+  return v;
+}
 
 interface Rel {
   id: string;
@@ -25,26 +36,46 @@ const REL_TYPES = ['one-to-one','one-to-many','many-to-one','many-to-many','embe
 export function RelationshipsClient({ role }: { role: string }) {
   const [list, setList] = useState<Rel[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [status, setStatus] = useState<string>('suggested');
   const [type, setType] = useState<string>('');
   const [collection, setCollection] = useState<string>('');
   const [q, setQ] = useState('');
   const [minC, setMinC] = useState(0);
   const [creating, setCreating] = useState(false);
+  const abortRef = useRef<AbortController | null>(null);
+  const firstLoadRef = useRef(true);
+
+  // Debounce only the high-frequency inputs; selects/buttons stay instant.
+  const qDeb = useDebounced(q, 300);
+  const collectionDeb = useDebounced(collection, 300);
+  const minCDeb = useDebounced(minC, 200);
 
   const load = useCallback(async () => {
-    setLoading(true);
+    abortRef.current?.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
+    if (firstLoadRef.current) setLoading(true); else setRefreshing(true);
     const p = new URLSearchParams();
     if (status) p.set('status', status);
     if (type) p.set('type', type);
-    if (collection) p.set('collection', collection);
-    if (q) p.set('q', q);
-    p.set('minConfidence', String(minC));
+    if (collectionDeb) p.set('collection', collectionDeb);
+    if (qDeb) p.set('q', qDeb);
+    p.set('minConfidence', String(minCDeb));
     p.set('maxConfidence', '100');
-    const r = await fetch('/api/intel/relationships?' + p.toString());
-    if (r.ok) setList((await r.json()).relationships);
-    setLoading(false);
-  }, [status, type, collection, q, minC]);
+    try {
+      const r = await fetch('/api/intel/relationships?' + p.toString(), { signal: ac.signal });
+      if (r.ok) setList((await r.json()).relationships);
+    } catch (e) {
+      if ((e as { name?: string }).name === 'AbortError') return;
+    } finally {
+      if (!ac.signal.aborted) {
+        firstLoadRef.current = false;
+        setLoading(false);
+        setRefreshing(false);
+      }
+    }
+  }, [status, type, collectionDeb, qDeb, minCDeb]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -99,12 +130,13 @@ export function RelationshipsClient({ role }: { role: string }) {
           <input type="range" min={0} max={100} value={minC} onChange={e => setMinC(Number(e.target.value))} />
           <span className="tabular-nums w-6">{minC}</span>
         </label>
+        <span className={`text-2xs text-muted transition-opacity duration-150 ${refreshing ? 'opacity-100' : 'opacity-0'}`}>Refreshing…</span>
       </div>
 
       {creating && <NewRelationshipForm onClose={() => setCreating(false)} onCreated={() => { setCreating(false); void load(); }} />}
 
       <div className="card">
-        <div className="table-wrap rounded-b-none">
+        <div className={`table-wrap rounded-b-none transition-opacity duration-150 ${refreshing ? 'opacity-70' : 'opacity-100'}`}>
           <table className="bi">
             <thead><tr>
               <th>Source</th><th></th><th>Target</th>

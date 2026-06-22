@@ -4,8 +4,8 @@ import { Db } from 'mongodb';
 import { requireRole } from '@/lib/auth';
 import { getSchema, type SchemaDigest } from '@/lib/schema';
 import { agenticReport, type ChatMessage, type LlmReport, type AgenticTurn } from '@/lib/llm';
-import { validatePipeline } from '@/lib/pipeline-guard';
-import { dataDb } from '@/lib/mongo';
+import { validatePipeline, lowerPipeline } from '@/lib/pipeline-guard';
+import { dataDb, getServerInfo } from '@/lib/mongo';
 import { env } from '@/lib/env';
 
 export const runtime = 'nodejs';
@@ -84,7 +84,7 @@ function normalizeReport(turn: AgenticTurn): LlmReport | null {
 // Validate + execute a single report. Returns the sealed report (with the
 // pipeline as the guard returned it) and an Execution result. Never throws
 // — Mongo errors become { ok:false, error }.
-async function runReport(db: Db, report: LlmReport): Promise<{ sealed: LlmReport; execution: Execution }> {
+async function runReport(db: Db, report: LlmReport, version: [number, number]): Promise<{ sealed: LlmReport; execution: Execution }> {
   let validated;
   try { validated = validatePipeline({ collection: report.collection, pipeline: report.pipeline }); }
   catch (e) {
@@ -93,11 +93,22 @@ async function runReport(db: Db, report: LlmReport): Promise<{ sealed: LlmReport
       execution: { ok: false, error: 'invalid_pipeline: ' + (e instanceof Error ? e.message : String(e)) },
     };
   }
-  const sealed: LlmReport = { ...report, collection: validated.collection, pipeline: validated.pipeline };
+  // Rewrite modern date-math operators into literals for older servers.
+  // Surfaces a clear error back to the self-repair loop when something
+  // genuinely can't be lowered.
+  let lowered: Record<string, unknown>[];
+  try { lowered = lowerPipeline(validated.pipeline, version); }
+  catch (e) {
+    return {
+      sealed: { ...report, collection: validated.collection, pipeline: validated.pipeline },
+      execution: { ok: false, error: 'unsupported_operator: ' + (e instanceof Error ? e.message : String(e)) },
+    };
+  }
+  const sealed: LlmReport = { ...report, collection: validated.collection, pipeline: lowered };
   const t0 = Date.now();
   try {
     const rows = await db.collection(validated.collection)
-      .aggregate(validated.pipeline, { maxTimeMS: env.REPORT_MAX_TIME_MS, allowDiskUse: false })
+      .aggregate(lowered, { maxTimeMS: env.REPORT_MAX_TIME_MS, allowDiskUse: false })
       .toArray();
     return {
       sealed,
@@ -109,9 +120,10 @@ async function runReport(db: Db, report: LlmReport): Promise<{ sealed: LlmReport
 }
 
 async function callAgent(
-  history: ChatMessage[], lastReport: LlmReport | null, pendingError: string | null, digest: SchemaDigest,
+  history: ChatMessage[], lastReport: LlmReport | null, pendingError: string | null,
+  digest: SchemaDigest, serverVersion: { major: number; minor: number; raw: string },
 ): Promise<AgenticTurn | { error: string }> {
-  try { return await agenticReport({ history, lastReport, pendingError }, digest); }
+  try { return await agenticReport({ history, lastReport, pendingError, serverVersion }, digest); }
   catch (e) { return { error: e instanceof Error ? e.message : String(e) }; }
 }
 
@@ -121,12 +133,13 @@ export async function POST(req: Request) {
   if (!parsed.success) return NextResponse.json({ error: 'invalid_body' }, { status: 400 });
 
   const { history, lastReport, execute = true, maxRepairs = 2 } = parsed.data;
-  const digest = await getSchema(false);
+  const [digest, serverInfo] = await Promise.all([getSchema(false), getServerInfo()]);
+  const version: [number, number] = [serverInfo.major, serverInfo.minor];
   const history2: ChatMessage[] = history.map(m => ({ role: m.role, content: m.content }));
   const db = await dataDb();
 
   // --- Initial turn ---------------------------------------------------------
-  const first = await callAgent(history2, lastReport ?? null, null, digest);
+  const first = await callAgent(history2, lastReport ?? null, null, digest, serverInfo);
   if ('error' in first) {
     return NextResponse.json({ error: 'llm_failed', message: first.error }, { status: 502 });
   }
@@ -141,7 +154,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ kind: 'report', message: first.message, report: firstNormalized, execution: null, repairs: [] });
   }
 
-  const initial = await runReport(db, firstNormalized);
+  const initial = await runReport(db, firstNormalized, version);
   const attempts: Attempt[] = [{ source: 'initial', message: first.message, report: initial.sealed, execution: initial.execution }];
 
   // --- Self-repair loop -----------------------------------------------------
@@ -151,7 +164,7 @@ export async function POST(req: Request) {
   let current = attempts[0];
   for (let i = 0; i < maxRepairs && !current.execution.ok; i++) {
     const errMsg = current.execution.error ?? 'unknown_error';
-    const next = await callAgent(history2, current.report, errMsg, digest);
+    const next = await callAgent(history2, current.report, errMsg, digest, serverInfo);
     if ('error' in next) {
       break;
     }
@@ -165,7 +178,7 @@ export async function POST(req: Request) {
         repairs: attempts.slice(1),
       });
     }
-    const ran = await runReport(db, norm);
+    const ran = await runReport(db, norm, version);
     current = { source: 'repair', message: next.message, report: ran.sealed, execution: ran.execution };
     attempts.push(current);
     if (current.execution.ok) break;
