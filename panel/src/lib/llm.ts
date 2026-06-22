@@ -365,6 +365,23 @@ Constraints on report output (when kind="report"):
 - Pick a display.kind that matches the shape ("bar" / "line" / "pie" /
   "area" / "table") with appropriate xField / yField.
 
+Self-repair mode:
+- The system message may contain a "Pending execution error" block. That
+  is a MongoDB runtime error from the previous report you produced. Your
+  job for that turn is to diagnose and emit a CORRECTED full report
+  (kind="report"). Do NOT ask the user a question while a pending error
+  is present unless the schema genuinely cannot satisfy the request.
+- The user themselves may also paste an error into the chat. Treat that
+  the same way — repair the previous report.
+- Common pitfalls to consider when repairing:
+    * Wrong/non-existent field → pick the closest field from the schema.
+    * "must be an accumulator object" → use $sum/$avg/$first/$last/$min/
+      $max/$push/$addToSet inside $group; no leading whitespace on $ops.
+    * Type mismatch → wrap with $toDate, $toInt, $toString, etc.
+    * $lookup join key mismatch → align ObjectId vs string types.
+    * Date math → use $dateSubtract / $dateTrunc / $dateFromString.
+- In "message" briefly explain (one sentence) what was changed and why.
+
 Language:
 - "message" MUST be in the same language as the user's most recent message
   (Persian/Farsi, Arabic, English, ...). Field, collection and operator
@@ -406,6 +423,7 @@ const AGENTIC_SCHEMA = {
 export interface AgenticContext {
   history: ChatMessage[];
   lastReport?: LlmReport | null;
+  pendingError?: string | null;
 }
 
 export async function agenticReport(ctx: AgenticContext, digest: SchemaDigest): Promise<AgenticTurn> {
@@ -416,7 +434,10 @@ export async function agenticReport(ctx: AgenticContext, digest: SchemaDigest): 
     ctx.lastReport
       ? `Previous report (you may revise this if the user asks):\n${JSON.stringify(ctx.lastReport, null, 2)}`
       : 'No previous report yet in this session.',
-  ].join('\n\n');
+    ctx.pendingError
+      ? `Pending execution error from the previous report — diagnose and emit a CORRECTED report this turn:\n${ctx.pendingError}`
+      : '',
+  ].filter(Boolean).join('\n\n');
   const resp = await c.chat.completions.create({
     model: env.OPENAI_MODEL,
     temperature: 0.15,

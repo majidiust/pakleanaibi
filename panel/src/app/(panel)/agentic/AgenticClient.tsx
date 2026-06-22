@@ -11,8 +11,15 @@ interface LlmReport {
   warnings?: string[];
 }
 interface Execution { ok: boolean; rows?: Record<string, unknown>[]; took?: number; count?: number; truncated?: boolean; error?: string }
-interface ChatMsg { role: 'user' | 'assistant'; content: string; kind?: 'question' | 'report' }
-interface TurnResponse { kind: 'question' | 'report'; message: string; report?: LlmReport; execution?: Execution | null }
+interface RepairAttempt { message: string; report: LlmReport; execution: Execution }
+interface ChatMsg { role: 'user' | 'assistant'; content: string; kind?: 'question' | 'report' | 'repair' }
+interface TurnResponse {
+  kind: 'question' | 'report';
+  message: string;
+  report?: LlmReport;
+  execution?: Execution | null;
+  repairs?: RepairAttempt[];
+}
 
 const EXAMPLES = [
   'Top 10 users by number of orders in the last 30 days',
@@ -52,7 +59,17 @@ export function AgenticClient() {
       });
       const j = (await r.json()) as TurnResponse & { error?: string; message?: string };
       if (!r.ok) { setErr(j.message ?? j.error ?? 'request failed'); setBusy(null); return; }
-      setHistory(h => [...h, { role: 'assistant', content: j.message, kind: j.kind }]);
+      // Build the post-turn chat: the initial assistant turn, then one
+      // bubble per auto-repair attempt so the user can follow what the
+      // agent did to recover from each execution failure.
+      const appended: ChatMsg[] = [{ role: 'assistant', content: j.message, kind: j.kind }];
+      for (const rep of j.repairs ?? []) {
+        const verdict = rep.execution.ok
+          ? ` ✓ (${rep.execution.count ?? rep.execution.rows?.length ?? 0} rows)`
+          : ` ✗ (${rep.execution.error ?? 'failed'})`;
+        appended.push({ role: 'assistant', content: rep.message + verdict, kind: 'repair' });
+      }
+      setHistory(h => [...h, ...appended]);
       if (j.kind === 'report' && j.report) {
         setReport(j.report);
         setExecution(j.execution ?? null);
@@ -225,6 +242,7 @@ function ChatPanel({ history, input, busy, chatRef, onInput, onSend, onExample, 
             ].join(' ')}>
               {m.kind === 'report' && <div className="text-2xs text-accent-hi mb-1 uppercase tracking-[0.08em]">report</div>}
               {m.kind === 'question' && <div className="text-2xs text-warn mb-1 uppercase tracking-[0.08em]">clarify</div>}
+              {m.kind === 'repair' && <div className="text-2xs text-warn mb-1 uppercase tracking-[0.08em]">auto-repair</div>}
               {m.content}
             </div>
           </div>
