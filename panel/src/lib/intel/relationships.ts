@@ -1,5 +1,12 @@
-// Relationship discovery. Operates exclusively on the metadata produced by
-// discover.ts plus optional value-level validation against the data DB.
+// Database-agnostic relationship discovery.
+//
+// The engine never assumes specific collections (no "users", "orders", ...)
+// or specific field names. It only consumes:
+//   1) The metadata produced by discover.ts (field paths incl. nested,
+//      types, examples, uniqueness, presence, arrayOf, indexes).
+//   2) The supplied corpus of collections (names + identifier fields).
+//   3) Optional value-level probes against the live data DB to confirm that
+//      a candidate source value actually exists in a candidate target.
 import { ObjectId } from 'mongodb';
 import { dataDb } from '../mongo';
 import type {
@@ -7,243 +14,328 @@ import type {
   DetectionMethod, FieldSample,
 } from './types';
 import { intelLearning } from './storage';
-
-// Common soft-relationship keys -> target field on the destination side.
-const SOFT_KEYS: { field: RegExp; matchOn: string; entity: RegExp }[] = [
-  { field: /^email$|\.email$/, matchOn: 'email', entity: /user|account|member/i },
-  { field: /^slug$|\.slug$/,    matchOn: 'slug',  entity: /store|shop|product|business/i },
-  { field: /^username$|\.username$/, matchOn: 'username', entity: /user|account/i },
-  { field: /^phone$|\.phone$|^mobile$/, matchOn: 'phone', entity: /user|account|customer/i },
-  { field: /externalpaymentid$/i, matchOn: 'externalPaymentId', entity: /payment|transaction/i },
-];
-
-function fingerprint(r: Pick<IntelRelationship, 'source' | 'target' | 'type'>): string {
-  return [
-    r.source.collection, r.source.field,
-    r.target.collection, r.target.field, r.type,
-  ].join('::');
-}
-
-// Derive a candidate target collection name from a field like "userId" / "user_id"
-// / "user.ref" / "userRef". Returns the singular stem.
-function stemFromForeignKey(path: string): string | null {
-  const last = path.split('.').pop()!;
-  // userId, user_id, userRef, userOid
-  const m = last.match(/^([a-zA-Z][a-zA-Z0-9]*?)(?:_)?(?:id|oid|ref|_ref)$/i);
-  if (!m) return null;
-  let stem = m[1];
-  if (stem.length < 2) return null;
-  // Camel -> lower for matching
-  return stem.charAt(0).toLowerCase() + stem.slice(1);
-}
-
-// Build a name index for the available collections to make lookup tolerant
-// of pluralisation and casing differences.
-function buildNameIndex(collections: IntelCollection[]) {
-  const exact = new Map<string, IntelCollection>();
-  const stems = new Map<string, IntelCollection[]>();
-  for (const c of collections) {
-    exact.set(c.name.toLowerCase(), c);
-    const stem = singularize(c.name).toLowerCase();
-    const arr = stems.get(stem) ?? [];
-    arr.push(c);
-    stems.set(stem, arr);
-  }
-  return { exact, stems };
-}
-
-function singularize(n: string): string {
-  if (/ies$/.test(n)) return n.replace(/ies$/, 'y');
-  if (/sses$/.test(n)) return n.replace(/es$/, '');
-  if (/s$/.test(n) && !/ss$/.test(n)) return n.replace(/s$/, '');
-  return n;
-}
-
-function findTarget(stem: string, idx: ReturnType<typeof buildNameIndex>): IntelCollection | null {
-  const lower = stem.toLowerCase();
-  return idx.exact.get(lower)
-      ?? idx.exact.get(lower + 's')
-      ?? idx.exact.get(lower + 'es')
-      ?? idx.stems.get(lower)?.[0]
-      ?? null;
-}
+import {
+  tokens, singular, nameSimilarity, inferAbbreviations, type NameMatch,
+} from './naming';
 
 interface Signal { label: string; weight: number; note?: string }
 
-async function validateObjectIdRef(
-  source: IntelCollection, field: FieldSample, target: IntelCollection,
-): Promise<{ matched: number; checked: number }> {
-  // Take the first few example values and probe whether they exist in target._id.
-  const candidates: ObjectId[] = [];
-  for (const ex of field.examples) {
-    if (ex instanceof ObjectId) candidates.push(ex);
-    else if (typeof ex === 'string' && /^[0-9a-fA-F]{24}$/.test(ex)) {
-      try { candidates.push(new ObjectId(ex)); } catch { /* ignore */ }
-    }
-    if (candidates.length >= 5) break;
-  }
-  if (candidates.length === 0) return { matched: 0, checked: 0 };
-  const db = await dataDb();
-  const found = await db.collection(target.name)
-    .countDocuments({ _id: { $in: candidates } }, { limit: candidates.length });
-  return { matched: found, checked: candidates.length };
+function fingerprint(r: Pick<IntelRelationship, 'source' | 'target' | 'type'>): string {
+  return [r.source.collection, r.source.field, r.target.collection, r.target.field, r.type].join('::');
 }
-
-async function validateSoftRef(
-  field: FieldSample, target: IntelCollection, matchOn: string,
-): Promise<{ matched: number; checked: number }> {
-  const values = field.examples
-    .filter(v => v !== null && v !== undefined && typeof v !== 'object')
-    .slice(0, 5);
-  if (values.length === 0) return { matched: 0, checked: 0 };
-  const db = await dataDb();
-  const found = await db.collection(target.name)
-    .countDocuments({ [matchOn]: { $in: values } }, { limit: values.length });
-  return { matched: found, checked: values.length };
-}
-
-function cardinalityFor(source: FieldSample): '1:1' | 'N:1' {
-  // If the source field is highly unique it's likely 1:1; otherwise N:1.
-  return source.uniqueness > 0.9 ? '1:1' : 'N:1';
+export function relFingerprint(r: Pick<IntelRelationship, 'source' | 'target' | 'type'>): string {
+  return fingerprint(r);
 }
 
 function scoreFrom(signals: Signal[]): number {
-  // Weights sum into a 0-100 score, clamped.
   const total = signals.reduce((a, s) => a + s.weight, 0);
   return Math.max(0, Math.min(100, Math.round(total)));
 }
 
-// Apply learned biases stored in intel_learning. Patterns are matched on a
-// stable signature so the same (sourceColl, sourceField->targetColl, type)
-// triple gets the same bias as it did when last reviewed.
 async function applyLearning(rel: Pick<IntelRelationship, 'source' | 'target' | 'type'>, signals: Signal[]) {
   const coll = await intelLearning();
   const pat = `${rel.source.collection}.${rel.source.field}->${rel.target.collection}:${rel.type}`;
   const hit = await coll.findOne({ pattern: pat });
-  if (hit) signals.push({ label: hit.delta > 0 ? 'previously approved pattern' : 'previously rejected pattern',
-    weight: hit.delta * 15, note: hit.hint });
+  if (hit) signals.push({
+    label: hit.delta > 0 ? 'previously approved pattern' : 'previously rejected pattern',
+    weight: hit.delta * 15, note: hit.hint,
+  });
 }
 
-async function trySoftRefs(source: IntelCollection, field: FieldSample, collections: IntelCollection[]):
-  Promise<IntelRelationship | null> {
-  for (const k of SOFT_KEYS) {
-    if (!k.field.test(field.path)) continue;
-    // Find a target collection whose entity tag / name matches and has the matchOn field.
-    const target = collections.find(c =>
-      k.entity.test(c.name) && c.fields.some(f => f.path === k.matchOn));
-    if (!target || target.name === source.name) continue;
-    const sig: Signal[] = [
-      { label: `field name matches soft key /${k.field.source}/`, weight: 35 },
-      { label: `target collection ${target.name} has field ${k.matchOn}`, weight: 25 },
-    ];
-    const v = await validateSoftRef(field, target, k.matchOn).catch(() => ({ matched: 0, checked: 0 }));
-    if (v.checked) sig.push({
-      label: `${v.matched}/${v.checked} example values exist in target`,
-      weight: (v.matched / v.checked) * 30, note: 'value-level validation',
-    });
-    const type: RelationshipType = 'soft';
-    const rel: IntelRelationship = {
-      fingerprint: fingerprint({ source: { collection: source.name, field: field.path },
-                                  target: { collection: target.name, field: '_id', matchOn: k.matchOn }, type }),
-      source: { collection: source.name, field: field.path },
-      target: { collection: target.name, field: '_id', matchOn: k.matchOn },
-      type, cardinality: cardinalityFor(field),
-      status: 'suggested',
-      confidence: 0, detection: 'soft-name', reason: '', signals: sig,
-      tags: [], createdAt: new Date(), updatedAt: new Date(),
-    };
-    await applyLearning(rel, sig);
-    rel.confidence = scoreFrom(sig);
-    rel.reason = `Soft key '${field.path}' matches '${k.matchOn}' on ${target.name}.`;
-    return rel;
+// ----- Target-candidate index ---------------------------------------------
+// Each collection contributes its tokenised name and every field that looks
+// like an identifier the rest of the corpus might point at:
+//   * _id (always),
+//   * any field referenced by a single-key unique index,
+//   * any field whose sampled uniqueness >= 0.95 with reasonable presence.
+interface TargetField { path: string; types: Set<string>; unique: boolean }
+interface TargetColl  { coll: IntelCollection; nameSing: string[]; identifiers: TargetField[] }
+
+function buildTargetIndex(collections: IntelCollection[]): TargetColl[] {
+  return collections.map(c => {
+    const ids: TargetField[] = [{ path: '_id', types: new Set(['objectId']), unique: true }];
+    const uniqIdx = new Set<string>();
+    for (const idx of c.indexes) {
+      const keys = Object.keys(idx.keys);
+      if (idx.unique && keys.length === 1) uniqIdx.add(keys[0]);
+    }
+    for (const f of c.fields) {
+      if (f.path === '_id') continue;
+      const looksUnique = uniqIdx.has(f.path) || (f.uniqueness >= 0.95 && f.presence >= 0.5);
+      if (!looksUnique) continue;
+      ids.push({ path: f.path, types: new Set<string>(f.types as string[]), unique: true });
+    }
+    return { coll: c, nameSing: tokens(c.name).map(singular), identifiers: ids };
+  });
+}
+
+// ----- FK suffix inference (data-driven) ---------------------------------
+// We start from a tiny set of universally-recognised identifier suffixes
+// ("id", "ref", "key", ...) and augment with any short trailing token that
+// appears as the last segment of many multi-token field names across the
+// corpus and is NOT itself a target collection name.
+const BASE_SUFFIXES = ['id', 'ids', 'oid', 'ref', 'refs', 'key', 'keys', 'no', 'num', 'code'];
+function inferSuffixes(corpus: IntelCollection[]): Set<string> {
+  const counts = new Map<string, number>();
+  for (const c of corpus) for (const f of c.fields) {
+    const tk = tokens(f.path.split('.').pop() ?? '');
+    if (tk.length < 2) continue;
+    const last = tk[tk.length - 1];
+    counts.set(last, (counts.get(last) ?? 0) + 1);
   }
-  return null;
+  const collNames = new Set<string>(corpus.flatMap(c => tokens(c.name).map(singular)));
+  const set = new Set<string>(BASE_SUFFIXES);
+  for (const [tok, n] of counts) {
+    if (n >= 3 && tok.length <= 4 && !collNames.has(singular(tok))) set.add(tok);
+  }
+  return set;
 }
 
-async function tryEmbedded(source: IntelCollection, field: FieldSample): Promise<IntelRelationship | null> {
-  // Heuristic embedded relationship: a field is an object/array of objects
-  // with its own _id-like structure. The "target" is conceptual (the embedded
-  // shape lives inside the source). Reported as type=embedded.
-  const isEmbeddedObj = field.types.includes('object') || (field.arrayOf?.includes('object') ?? false);
-  if (!isEmbeddedObj) return null;
-  // Avoid the trivial cases where the doc has a sub-object that is not a list of entities.
-  if (!source.fields.some(f => f.path.startsWith(field.path + '.') && /_id|id$/i.test(f.path))) return null;
-  const sig: Signal[] = [
-    { label: 'embedded object structure detected', weight: 60 },
-    { label: 'sub-document has its own id-like field', weight: 25 },
-  ];
-  const type: RelationshipType = 'embedded';
+interface Stem { stem: string; trailingPlural: boolean }
+function stemFromFieldName(path: string, suffixes: Set<string>): Stem | null {
+  const last = path.split('.').pop() ?? '';
+  const tk = tokens(last);
+  if (!tk.length) return null;
+  let i = tk.length;
+  while (i > 0 && suffixes.has(tk[i - 1])) i--;
+  if (i === 0) return null;
+  const trailingPlural = i < tk.length && /s$/.test(tk[i]); // userIds -> plural ref
+  const head = tk.slice(0, i).map(singular);
+  if (!head.length) return null;
+  return { stem: head.join(''), trailingPlural };
+}
+
+// ----- Value-level probe --------------------------------------------------
+async function probeValueMatch(field: FieldSample, target: TargetColl, tf: TargetField): Promise<{
+  checked: number; matched: number; sample: unknown[];
+}> {
+  const exs = (field.examples ?? []).filter(v => v !== null && v !== undefined);
+  if (!exs.length) return { checked: 0, matched: 0, sample: [] };
+
+  let candidates: unknown[] = [];
+  for (const v of exs) {
+    if (Array.isArray(v)) { for (const el of v) candidates.push(el); }
+    else if (typeof v === 'object' && !(v instanceof ObjectId)) continue; // skip raw embedded
+    else candidates.push(v);
+    if (candidates.length >= 8) break;
+  }
+  candidates = candidates.slice(0, 8);
+
+  const targetIsOid = tf.types.has('objectId');
+  const coerced: unknown[] = [];
+  for (const v of candidates) {
+    if (targetIsOid) {
+      if (v instanceof ObjectId) coerced.push(v);
+      else if (typeof v === 'string' && /^[0-9a-fA-F]{24}$/.test(v)) {
+        try { coerced.push(new ObjectId(v)); } catch { /* ignore */ }
+      }
+    } else if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+      coerced.push(v);
+    }
+  }
+  if (!coerced.length) return { checked: 0, matched: 0, sample: [] };
+
+  const db = await dataDb();
+  const matched = await db.collection(target.coll.name)
+    .countDocuments(
+      { [tf.path]: { $in: coerced } } as Record<string, unknown>,
+      { limit: coerced.length, maxTimeMS: 5000 },
+    )
+    .catch(() => 0);
   return {
-    fingerprint: fingerprint({ source: { collection: source.name, field: field.path },
-                                target: { collection: source.name, field: field.path }, type }),
-    source: { collection: source.name, field: field.path },
-    target: { collection: source.name, field: field.path },
-    type, cardinality: field.arrayOf ? '1:N' : '1:1',
-    status: 'suggested', confidence: scoreFrom(sig), detection: 'embedded',
-    reason: `'${field.path}' looks like an embedded entity inside ${source.name}.`,
-    signals: sig, tags: [], createdAt: new Date(), updatedAt: new Date(),
+    checked: coerced.length, matched,
+    sample: coerced.slice(0, 3).map(v => v instanceof ObjectId ? String(v) : v),
   };
 }
 
-async function tryObjectIdRef(
-  source: IntelCollection, field: FieldSample, collections: IntelCollection[],
-  nameIdx: ReturnType<typeof buildNameIndex>,
+// ----- Direction / cardinality from sampled data --------------------------
+function classifyDirection(src: FieldSample, srcIsArray: boolean, tgtUnique: boolean):
+  { type: RelationshipType; cardinality: '1:1' | '1:N' | 'N:1' | 'N:N' } {
+  if (srcIsArray) {
+    return tgtUnique ? { type: 'many-to-many', cardinality: 'N:N' }
+                     : { type: 'one-to-many',  cardinality: '1:N' };
+  }
+  if (src.uniqueness >= 0.95) {
+    return tgtUnique ? { type: 'one-to-one',  cardinality: '1:1' }
+                     : { type: 'one-to-many', cardinality: '1:N' };
+  }
+  return { type: 'many-to-one', cardinality: 'N:1' };
+}
+
+// ----- Per-candidate evaluation -------------------------------------------
+async function evaluateCandidate(
+  source: IntelCollection, field: FieldSample,
+  target: TargetColl, tf: TargetField, nm: NameMatch,
 ): Promise<IntelRelationship | null> {
-  const types = new Set(field.types);
-  const isOid = types.has('objectId') || (types.has('string') && field.looksLikeObjectIdString);
-  if (!isOid) return null;
-  const stem = stemFromForeignKey(field.path);
-  if (!stem) return null;
-  const target = findTarget(stem, nameIdx);
-  if (!target || target.name === source.name) return null;
-  const sig: Signal[] = [
-    { label: 'field name matches foreign-key pattern', weight: 25, note: stem },
-    { label: 'value type is ObjectId or 24-hex string', weight: 25 },
-    { label: `name stem resolves to collection ${target.name}`, weight: 20 },
+  const srcTypes = new Set<string>(field.types as string[]);
+  const arrEl = new Set<string>(field.arrayOf ?? []);
+  const sourceIsArray = srcTypes.has('array');
+  const targetIsOid = tf.types.has('objectId');
+
+  const isOidLike =
+    srcTypes.has('objectId') || arrEl.has('objectId') ||
+    (!!field.looksLikeObjectIdString && (srcTypes.has('string') || arrEl.has('string')));
+
+  // ---- Type-compatibility gate ----
+  let typeFit = 0; const typeReasons: string[] = [];
+  if (targetIsOid) {
+    if (!isOidLike) return null;
+    typeFit = 1; typeReasons.push('ObjectId-compatible');
+  } else {
+    const overlap = new Set<string>([...srcTypes, ...arrEl].filter(t => tf.types.has(t)));
+    overlap.delete('null'); overlap.delete('array'); overlap.delete('object');
+    if (!overlap.size) return null;
+    typeFit = 0.7; typeReasons.push(`scalar type overlap (${[...overlap].join('|')})`);
+  }
+
+  const probe = await probeValueMatch(field, target, tf).catch(() => ({ checked: 0, matched: 0, sample: [] as unknown[] }));
+
+  const signals: Signal[] = [
+    { label: 'name similarity', weight: Math.round(nm.score * 30),
+      note: nm.evidence.join('; ') || undefined },
+    { label: 'type compatibility', weight: Math.round(typeFit * 25),
+      note: typeReasons.join('; ') || undefined },
   ];
-  const v = await validateObjectIdRef(source, field, target).catch(() => ({ matched: 0, checked: 0 }));
-  if (v.checked) sig.push({
-    label: `${v.matched}/${v.checked} example ObjectIds exist in ${target.name}._id`,
-    weight: (v.matched / v.checked) * 30, note: 'value-level validation',
-  });
-  const detection: DetectionMethod = types.has('objectId') ? 'objectId-naming' : 'soft-value';
-  const type: RelationshipType = 'many-to-one';
+  if (tf.unique && tf.path !== '_id') {
+    signals.push({ label: `target field is unique (${tf.path})`, weight: 5 });
+  }
+  if (probe.checked) {
+    const ratio = probe.matched / probe.checked;
+    signals.push({
+      label: `value match ${probe.matched}/${probe.checked} in ${target.coll.name}.${tf.path}`,
+      weight: Math.round(ratio * 40),
+      note: probe.sample.length ? `samples: ${probe.sample.map(String).join(', ')}` : undefined,
+    });
+    if (probe.matched === 0) {
+      signals.push({ label: 'no sampled value found in target', weight: -25 });
+    }
+  } else {
+    signals.push({ label: 'no values available for live validation', weight: -10 });
+  }
+
+  const { type, cardinality } = classifyDirection(field, sourceIsArray, tf.unique);
+  const detection: DetectionMethod = targetIsOid
+    ? (srcTypes.has('objectId') || arrEl.has('objectId') ? 'objectId-naming' : 'objectId-value')
+    : 'soft-value';
+
   const rel: IntelRelationship = {
-    fingerprint: fingerprint({ source: { collection: source.name, field: field.path },
-                                target: { collection: target.name, field: '_id' }, type }),
+    fingerprint: fingerprint({
+      source: { collection: source.name, field: field.path },
+      target: { collection: target.coll.name, field: tf.path }, type,
+    }),
     source: { collection: source.name, field: field.path },
-    target: { collection: target.name, field: '_id' },
-    type, cardinality: cardinalityFor(field),
+    target: {
+      collection: target.coll.name, field: tf.path,
+      matchOn: tf.path === '_id' ? undefined : tf.path,
+    },
+    type, cardinality,
     status: 'suggested', confidence: 0, detection,
-    reason: '', signals: sig, tags: [],
+    reason: '', signals, tags: [],
     createdAt: new Date(), updatedAt: new Date(),
   };
-  await applyLearning(rel, sig);
-  rel.confidence = scoreFrom(sig);
-  rel.reason = `Field '${field.path}' (${[...types].join('|')}) -> ${target.name}._id.`;
+  await applyLearning(rel, signals);
+  rel.confidence = scoreFrom(signals);
+
+  const bits = [`Field '${rel.source.field}' in ${rel.source.collection} likely references ${rel.target.collection}.${rel.target.field}.`];
+  if (nm.evidence.length) bits.push(`Naming: ${nm.evidence.join('; ')}.`);
+  if (probe.checked) bits.push(`Live probe: ${probe.matched}/${probe.checked} sampled values existed in target.`);
+  else bits.push('Live probe skipped (no sampled values available); suggested by naming + types only.');
+  rel.reason = bits.join(' ');
   return rel;
 }
 
+// ----- Embedded entity detection -----------------------------------------
+function tryEmbedded(source: IntelCollection, field: FieldSample): IntelRelationship | null {
+  const types = new Set<string>(field.types as string[]);
+  const arr = new Set<string>(field.arrayOf ?? []);
+  const isEmbedded = types.has('object') || arr.has('object');
+  if (!isEmbedded) return null;
+  const hasNestedId = source.fields.some(f =>
+    f.path.startsWith(field.path + '.') && /(^|\.)(_id|id)$/i.test(f.path));
+  if (!hasNestedId) return null;
+  const signals: Signal[] = [
+    { label: 'embedded object structure detected', weight: 60 },
+    { label: 'sub-document carries its own id-like field', weight: 25 },
+  ];
+  return {
+    fingerprint: fingerprint({
+      source: { collection: source.name, field: field.path },
+      target: { collection: source.name, field: field.path }, type: 'embedded',
+    }),
+    source: { collection: source.name, field: field.path },
+    target: { collection: source.name, field: field.path },
+    type: 'embedded',
+    cardinality: arr.has('object') ? '1:N' : '1:1',
+    status: 'suggested', confidence: scoreFrom(signals),
+    detection: 'embedded',
+    reason: `'${field.path}' looks like an embedded entity inside ${source.name}.`,
+    signals, tags: [], createdAt: new Date(), updatedAt: new Date(),
+  };
+}
+
+// ----- Orchestrator -------------------------------------------------------
+const TOP_K_PER_FIELD = 3;
+const NAME_SIM_CUTOFF = 0.5;
+const MIN_CONFIDENCE  = 25;
+
 export async function discoverRelationships(collections: IntelCollection[]): Promise<IntelRelationship[]> {
+  const targets = buildTargetIndex(collections);
+  const suffixes = inferSuffixes(collections);
+
+  // Corpus-driven abbreviation map.
+  const abbreviations = inferAbbreviations([
+    ...collections.map(c => c.name),
+    ...collections.flatMap(c => c.fields.map(f => f.path)),
+  ]);
+  const expand = (s: string): string[] => {
+    const hit = abbreviations.get(s);
+    return hit && hit !== s ? [s, hit] : [s];
+  };
+
   const out = new Map<string, IntelRelationship>();
-  const idx = buildNameIndex(collections);
   for (const src of collections) {
     for (const field of src.fields) {
       if (field.path === '_id') continue;
-      // 1) ObjectId / hex foreign-key reference.
-      const oid = await tryObjectIdRef(src, field, collections, idx);
-      if (oid) out.set(oid.fingerprint, oid);
-      // 2) Soft / domain-known reference (email, slug, ...).
-      const soft = await trySoftRefs(src, field, collections);
-      if (soft && !out.has(soft.fingerprint)) out.set(soft.fingerprint, soft);
-      // 3) Embedded entity.
-      const emb = await tryEmbedded(src, field);
+
+      // 1) Embedded entity (cheap, local).
+      const emb = tryEmbedded(src, field);
       if (emb && !out.has(emb.fingerprint)) out.set(emb.fingerprint, emb);
+
+      // 2) Cross-collection reference. Derive a "stem" purely from name
+      //    structure — no entity vocabulary.
+      const fk = stemFromFieldName(field.path, suffixes);
+      const stem = fk?.stem ?? '';
+      const variants = new Set<string>();
+      if (stem) for (const v of expand(stem)) variants.add(v);
+      // Also try the bare last segment so fields like "owner" or "parent"
+      // are evaluated against the corpus too.
+      const last = field.path.split('.').pop() ?? '';
+      if (last && (last !== '_id')) variants.add(last);
+
+      if (!variants.size) continue;
+
+      const scored: { tgt: TargetColl; nm: NameMatch }[] = [];
+      for (const t of targets) {
+        if (t.coll.name === src.name) continue;
+        let best: NameMatch = { score: 0, evidence: [] };
+        for (const v of variants) {
+          const nm = nameSimilarity(v, t.coll.name);
+          if (nm.score > best.score) best = nm;
+        }
+        if (best.score >= NAME_SIM_CUTOFF) scored.push({ tgt: t, nm: best });
+      }
+      scored.sort((a, b) => b.nm.score - a.nm.score);
+
+      for (const { tgt, nm } of scored.slice(0, TOP_K_PER_FIELD)) {
+        for (const tf of tgt.identifiers) {
+          const rel = await evaluateCandidate(src, field, tgt, tf, nm);
+          if (!rel || rel.confidence < MIN_CONFIDENCE) continue;
+          const prev = out.get(rel.fingerprint);
+          if (!prev || prev.confidence < rel.confidence) out.set(rel.fingerprint, rel);
+        }
+      }
     }
   }
-  return [...out.values()].sort((a, b) => b.confidence - a.confidence);
-}
 
-export function relFingerprint(r: Pick<IntelRelationship, 'source' | 'target' | 'type'>): string {
-  return fingerprint(r);
+  return [...out.values()].sort((a, b) => b.confidence - a.confidence);
 }

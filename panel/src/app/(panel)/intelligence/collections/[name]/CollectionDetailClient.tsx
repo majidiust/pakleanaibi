@@ -2,6 +2,7 @@
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { IntelTabs, PageHeader, Confidence, StatusBadge, TypeBadge } from '../../_ui';
+import { CollectionDataBrowser } from './CollectionDataBrowser';
 
 interface Field {
   path: string; types: string[]; arrayOf?: string[]; presence: number;
@@ -161,10 +162,8 @@ export function CollectionDetailClient({ name, role }: { name: string; role: str
         <RelList rels={incoming} side="source" />
       </Section>
 
-      <Section title="Sample documents">
-        <pre className="card card-pad text-xs overflow-x-auto whitespace-pre-wrap">
-          {JSON.stringify(c.samples, null, 2)}
-        </pre>
+      <Section title="Data">
+        <CollectionDataBrowser name={c.name} fields={c.fields} initialDocCount={c.docCount} />
       </Section>
     </div>
   );

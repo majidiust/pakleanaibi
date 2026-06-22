@@ -9,9 +9,17 @@ export interface CollectionInfo {
   count: number;
   fields: FieldInfo[];
 }
+export interface KnownRelationship {
+  source: { collection: string; field: string };
+  target: { collection: string; field: string; matchOn?: string };
+  type: string;
+  cardinality?: string;
+  status: 'approved' | 'manual';
+}
 export interface SchemaDigest {
   database: string;
   collections: CollectionInfo[];
+  relationships?: KnownRelationship[];
   generatedAt: string;
 }
 
@@ -64,9 +72,23 @@ export async function getSchema(force = false): Promise<SchemaDigest> {
     try { infos.push(await sampleCollection(name)); }
     catch { /* skip unreadable */ }
   }
+  // Pull only relationships that a human approved or created. Suggested /
+  // weak / rejected ones are intentionally withheld from the LLM so the
+  // model never invents joins from low-confidence guesses.
+  const relColl = bi.collection<{
+    source: { collection: string; field: string };
+    target: { collection: string; field: string; matchOn?: string };
+    type: string; cardinality?: string; status: string;
+  }>('intel_relationships');
+  const known = await relColl.find(
+    { status: { $in: ['approved', 'manual'] } },
+    { projection: { _id: 0, source: 1, target: 1, type: 1, cardinality: 1, status: 1 } },
+  ).toArray().catch(() => []);
+
   const digest: SchemaDigest = {
     database: db.databaseName,
     collections: infos.sort((a, b) => b.count - a.count),
+    relationships: known as KnownRelationship[],
     generatedAt: new Date().toISOString(),
   };
   await cache.updateOne(
@@ -83,6 +105,15 @@ export function schemaToPrompt(s: SchemaDigest): string {
   for (const c of s.collections) {
     const fields = c.fields.map(f => `${f.name}:${f.types.join('|')}`).join(', ');
     lines.push(`- ${c.name} (~${c.count} docs): ${fields}`);
+  }
+  const rels = s.relationships ?? [];
+  if (rels.length) {
+    lines.push('', 'Known relationships (human-confirmed; safe to use for $lookup joins):');
+    for (const r of rels) {
+      const tgt = r.target.matchOn ? `${r.target.collection}.${r.target.matchOn}` : `${r.target.collection}.${r.target.field}`;
+      const card = r.cardinality ? ` [${r.cardinality}]` : '';
+      lines.push(`- ${r.source.collection}.${r.source.field} -> ${tgt} (${r.type}${card}, ${r.status})`);
+    }
   }
   return lines.join('\n');
 }
