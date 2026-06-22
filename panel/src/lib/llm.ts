@@ -428,6 +428,52 @@ MULTI-HOP JOINS (read before producing any pipeline):
 - NEVER project a raw ObjectId like "items_joined.item" and call it the
   item name. The user wants the resolved label from the far collection.
 
+NAME RESOLUTION (resolve human-readable names to ids BEFORE filtering FKs):
+- Users almost always reference entities by NAME ("orders of خشکشویی
+  مهرآباد", "items called پیراهن", "customer Sarah"). The corresponding
+  column on the anchor is almost always an ID/ObjectId field (e.g.
+  "laundry.laundryId", "item", "customer", "*Id", "*_id", "*Ref"). A
+  human-readable string placed directly into such a field SILENTLY MATCHES
+  ZERO ROWS — Mongo compares an ObjectId column against a string and
+  finds nothing.
+- Rule: if the user supplied a NAME and the candidate filter field is an
+  ID/reference field (objectId-typed, or name ends in Id / _id / Ref /
+  matches a JOIN RECIPE localField), you MUST resolve the name through
+  the named entity's collection. Two acceptable strategies — pick the
+  one that matches an existing JOIN RECIPE:
+  (1) ANCHOR ON THE NAMED ENTITY when it is highly selective (single
+      named laundry, single named customer, ...):
+        collection: "<entity>"
+        [ $match {<nameField>: "<the name>"}, $limit 1,
+          $lookup <facts> via the reverse JOIN RECIPE
+            (localField: "_id", foreignField: "<FK on facts>"),
+          $unwind <facts>_joined,
+          $match {<facts>_joined.<other filters, e.g. date>: …},
+          $project …, $limit ]
+  (2) ANCHOR ON THE FACTS and use a NAME->ID $lookup. Filter on the
+      *resolved* name field AFTER the lookup, never on the raw FK:
+        collection: "<facts>"
+        [ $match {<other anchor filters, e.g. date>: …},
+          $lookup <entity> via the forward JOIN RECIPE
+            (localField: "<FK on facts>", foreignField: "_id"),
+          $unwind <entity>_joined,
+          $match {<entity>_joined.<nameField>: "<the name>"},
+          $project …, $limit ]
+- Identify the entity's name field by scanning its schema fields for an
+  obvious label column (name, title, label, displayName, fullName, etc.).
+  If multiple plausible name fields exist, prefer the one the user is
+  likely echoing (Persian text -> a localized name field if present).
+- If the name might be partial / inexact, use a case-insensitive regex
+  on the name field — { "$regex": "<name>", "$options": "i" } — and note
+  the assumption in "message".
+- ONLY treat the user-provided string as a literal ObjectId when it is
+  visibly a 24-character hex string. Otherwise it is a name and must be
+  resolved as above.
+- Mirror this same rule when REPAIRING a pipeline: if the previous turn
+  filtered an ID field against a non-hex string and returned 0 rows, the
+  fix is almost always to insert a NAME->ID $lookup and move the filter
+  to the resolved name field.
+
 Self-repair mode:
 - The system message may contain a "Pending execution error" block. That
   is a MongoDB runtime error from the previous report you produced. Your
