@@ -55,10 +55,19 @@ export function AgenticClient() {
     setInput('');
     setBusy('turn');
     try {
+      // Send only the recent slice of the conversation. The server applies
+      // its own window too, but trimming here keeps payloads small and
+      // avoids tripping the body validator after long sessions.
+      const recent = nextHist.slice(-24).map(m => ({
+        role: m.role,
+        // Defensive cap: long pasted errors or huge plan blocks could push a
+        // single message over the server's per-message limit.
+        content: m.content.length > 8000 ? m.content.slice(0, 8000) + '…' : m.content,
+      }));
       const r = await fetch('/api/reports/agentic', {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          history: nextHist.map(m => ({ role: m.role, content: m.content })),
+          history: recent,
           lastReport: report,
           execute: true,
         }),
@@ -237,7 +246,7 @@ function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, can
           {displayKind !== 'table' && report.display && (
             <ChartView rows={rows} display={report.display as ChartDisplay} />
           )}
-          <DataTable rows={rows} />
+          <DataTable rows={rows} title={report.display.title || report.collection} />
         </div>
       )}
       {execution?.ok && rows && rows.length === 0 && (

@@ -87,7 +87,7 @@ function AttemptCard({ a, last }: { a: Attempt; last: boolean }) {
           {a.display.kind !== 'table' && (
             <ChartView rows={a.rows} display={a.display as ChartDisplay} />
           )}
-          <DataTable rows={a.rows} />
+          <DataTable rows={a.rows} title={a.display.title || a.collection} />
         </div>
       )}
       {last && a.ok && a.rows && a.rows.length === 0 && (

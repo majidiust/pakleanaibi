@@ -11,11 +11,15 @@ import { env } from '@/lib/env';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+// History/content limits are deliberately generous: assistant messages can be
+// long (full plan + per-repair verdict) and conversations can accumulate
+// quickly. The route trims to a sliding window before calling the LLM, so
+// these caps only exist to reject obviously malformed payloads.
 const Body = z.object({
   history: z.array(z.object({
     role: z.enum(['user', 'assistant']),
-    content: z.string().min(1).max(4000),
-  })).min(1).max(40),
+    content: z.string().min(1).max(16000),
+  })).min(1).max(200),
   lastReport: z.object({
     collection: z.string(),
     pipeline: z.array(z.record(z.unknown())),
@@ -32,6 +36,11 @@ const Body = z.object({
   execute: z.boolean().optional(),
   maxRepairs: z.number().int().min(0).max(4).optional(),
 });
+
+// Keep the prompt focused on the most recent exchanges. Earlier turns are
+// summarised by the `lastReport` snapshot the client sends anyway, so we
+// don't lose useful state by dropping them.
+const HISTORY_WINDOW = 24;
 
 interface Execution {
   ok: boolean;
@@ -164,12 +173,25 @@ async function callAgent(
 export async function POST(req: Request) {
   try { await requireRole('admin', 'analyst'); } catch (r) { return r as Response; }
   const parsed = Body.safeParse(await req.json().catch(() => null));
-  if (!parsed.success) return NextResponse.json({ error: 'invalid_body' }, { status: 400 });
+  if (!parsed.success) {
+    // Surface the first failing path so the client can show a useful hint
+    // instead of an opaque "invalid_body".
+    const issue = parsed.error.issues[0];
+    return NextResponse.json({
+      error: 'invalid_body',
+      message: issue ? `${issue.path.join('.')}: ${issue.message}` : 'request payload failed validation',
+      issues: parsed.error.issues.slice(0, 5),
+    }, { status: 400 });
+  }
 
   const { history, lastReport, execute = true, maxRepairs = 2 } = parsed.data;
   const [digest, serverInfo] = await Promise.all([getSchema(false), getServerInfo()]);
   const version: [number, number] = [serverInfo.major, serverInfo.minor];
-  const history2: ChatMessage[] = history.map(m => ({ role: m.role, content: m.content }));
+  // Sliding window: drop everything but the most recent N turns. The LLM
+  // doesn't need ancient context, and trimming here keeps the prompt small
+  // even when the client forgets to do so.
+  const trimmed = history.length > HISTORY_WINDOW ? history.slice(-HISTORY_WINDOW) : history;
+  const history2: ChatMessage[] = trimmed.map(m => ({ role: m.role, content: m.content }));
   const db = await dataDb();
 
   // --- Initial turn ---------------------------------------------------------

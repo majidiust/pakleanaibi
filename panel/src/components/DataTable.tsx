@@ -10,6 +10,7 @@ import {
   type ColumnDef,
   type SortingState,
 } from '@tanstack/react-table';
+import { ExportModal } from './ExportModal';
 
 function fmtCell(v: unknown): string {
   if (v === null || v === undefined) return '';
@@ -18,9 +19,10 @@ function fmtCell(v: unknown): string {
   return String(v);
 }
 
-export function DataTable({ rows }: { rows: Record<string, unknown>[] }) {
+export function DataTable({ rows, title }: { rows: Record<string, unknown>[]; title?: string }) {
   const [sorting, setSorting] = useState<SortingState>([]);
   const [filter, setFilter] = useState('');
+  const [showExport, setShowExport] = useState(false);
 
   const columns = useMemo<ColumnDef<Record<string, unknown>>[]>(() => {
     const keys = new Set<string>();
@@ -46,9 +48,17 @@ export function DataTable({ rows }: { rows: Record<string, unknown>[] }) {
     initialState: { pagination: { pageSize: 25 } },
   });
 
-  const filtered = table.getFilteredRowModel().rows.length;
+  const filteredRows = table.getFilteredRowModel().rows;
+  const filtered = filteredRows.length;
   const pageIdx = table.getState().pagination.pageIndex;
   const pageCount = table.getPageCount() || 1;
+
+  // Export operates on the currently filtered + sorted view so the user gets
+  // exactly what they see in the UI, not the raw upstream array.
+  const exportRows = useMemo(
+    () => filteredRows.map(r => r.original as Record<string, unknown>),
+    [filteredRows],
+  );
 
   return (
     <div className="space-y-3">
@@ -61,11 +71,20 @@ export function DataTable({ rows }: { rows: Record<string, unknown>[] }) {
           <input className="input pl-8" placeholder="Filter rows…" value={filter}
             onChange={e => setFilter(e.target.value)} />
         </div>
-        <div className="text-xs text-muted num">
-          <span className="text-ink-2 font-medium">{filtered.toLocaleString()}</span>
-          <span className="mx-1">of</span>
-          <span className="text-ink-2 font-medium">{rows.length.toLocaleString()}</span>
-          <span className="ml-1">rows</span>
+        <div className="flex items-center gap-3">
+          <div className="text-xs text-muted num">
+            <span className="text-ink-2 font-medium">{filtered.toLocaleString()}</span>
+            <span className="mx-1">of</span>
+            <span className="text-ink-2 font-medium">{rows.length.toLocaleString()}</span>
+            <span className="ml-1">rows</span>
+          </div>
+          <button className="btn-ghost btn-sm" onClick={() => setShowExport(true)} disabled={rows.length === 0}
+                  title="Export to Excel or PDF">
+            <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M8 2v8m0 0 3-3m-3 3L5 7M2.5 11v1.5A1.5 1.5 0 0 0 4 14h8a1.5 1.5 0 0 0 1.5-1.5V11" />
+            </svg>
+            Export
+          </button>
         </div>
       </div>
       <div className="table-wrap">
@@ -117,6 +136,13 @@ export function DataTable({ rows }: { rows: Record<string, unknown>[] }) {
           </button>
         </div>
       </div>
+      {showExport && (
+        <ExportModal
+          rows={exportRows}
+          defaultTitle={title}
+          onClose={() => setShowExport(false)}
+        />
+      )}
     </div>
   );
 }

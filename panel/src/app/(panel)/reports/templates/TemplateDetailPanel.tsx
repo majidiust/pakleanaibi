@@ -152,7 +152,7 @@ export function TemplateDetailPanel({
           {template.display.kind !== 'table' && result.rows.length > 0 && (
             <ChartView rows={result.rows} display={template.display as ChartDisplay} />
           )}
-          {result.rows.length > 0 ? <DataTable rows={result.rows} />
+          {result.rows.length > 0 ? <DataTable rows={result.rows} title={template.title} />
             : <div className="surface p-4 text-sm text-muted">Query returned no rows.</div>}
         </div>
       )}
