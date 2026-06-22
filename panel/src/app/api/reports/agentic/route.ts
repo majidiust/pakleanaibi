@@ -50,25 +50,56 @@ export async function POST(req: Request) {
     }, { status: 502 });
   }
 
-  if (turn.kind === 'question' || !turn.report) {
-    return NextResponse.json({ kind: 'question', message: turn.message });
+  // Defensive shape check: even when the LLM says kind='report' the report
+  // object can be partially formed when strict JSON schema validation isn't
+  // enforced server-side. Downgrade malformed reports to a question turn so
+  // the UI never crashes on missing nested fields.
+  const r = turn.report;
+  const validShape =
+    turn.kind === 'report' &&
+    r && typeof r === 'object' &&
+    typeof r.collection === 'string' &&
+    Array.isArray(r.pipeline) &&
+    r.display && typeof r.display === 'object' &&
+    typeof (r.display as { kind?: unknown }).kind === 'string';
+
+  if (!validShape) {
+    return NextResponse.json({
+      kind: 'question',
+      message: turn.message || 'Could you tell me which collection and time range you have in mind?',
+    });
   }
+
+  // Normalize the report so downstream consumers can rely on its shape.
+  const normalized: LlmReport = {
+    collection: r!.collection,
+    pipeline: r!.pipeline,
+    display: {
+      kind: r!.display.kind,
+      xField: r!.display.xField,
+      yField: r!.display.yField,
+      seriesField: r!.display.seriesField,
+      title: r!.display.title,
+    },
+    explanation: typeof r!.explanation === 'string' ? r!.explanation : '',
+    warnings: Array.isArray(r!.warnings) ? r!.warnings : [],
+  };
 
   // kind === 'report': validate + (optionally) execute.
   let validated;
-  try { validated = validatePipeline({ collection: turn.report.collection, pipeline: turn.report.pipeline }); }
+  try { validated = validatePipeline({ collection: normalized.collection, pipeline: normalized.pipeline }); }
   catch (e) {
     return NextResponse.json({
       kind: 'report',
       message: turn.message,
-      report: turn.report,
+      report: normalized,
       execution: {
         ok: false,
         error: 'invalid_pipeline: ' + (e instanceof Error ? e.message : String(e)),
       },
     });
   }
-  const sealed: LlmReport = { ...turn.report, collection: validated.collection, pipeline: validated.pipeline };
+  const sealed: LlmReport = { ...normalized, collection: validated.collection, pipeline: validated.pipeline };
 
   if (!execute) {
     return NextResponse.json({ kind: 'report', message: turn.message, report: sealed, execution: null });

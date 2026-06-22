@@ -127,6 +127,7 @@ function ResultPanel({ report, execution, busy, onExecute }: {
     );
   }
   const rows = execution?.rows;
+  const displayKind = report.display?.kind ?? 'table';
   return (
     <div className="space-y-3">
       <div className="card card-pad space-y-2">
@@ -135,7 +136,7 @@ function ResultPanel({ report, execution, busy, onExecute }: {
             <span className="pill"><span className="text-muted mr-1">collection</span>
               <span className="font-mono text-ink">{report.collection}</span>
             </span>
-            <span className="pill num">display · {report.display.kind}</span>
+            <span className="pill num">display · {displayKind}</span>
             {execution?.ok && execution.took !== undefined && (
               <span className="pill-ok num">{execution.took} ms · {execution.count} rows{execution.truncated ? ' · truncated' : ''}</span>
             )}
@@ -168,7 +169,7 @@ function ResultPanel({ report, execution, busy, onExecute }: {
 
       {execution?.ok && rows && rows.length > 0 && (
         <div className="space-y-3">
-          {report.display.kind !== 'table' && (
+          {displayKind !== 'table' && report.display && (
             <ChartView rows={rows} display={report.display as ChartDisplay} />
           )}
           <DataTable rows={rows} />
