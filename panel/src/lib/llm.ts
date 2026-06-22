@@ -368,6 +368,35 @@ Constraints on report output (when kind="report"):
 - Pick a display.kind that matches the shape ("bar" / "line" / "pie" /
   "area" / "table") with appropriate xField / yField.
 
+PIPELINE PLANNING (read carefully — this prevents timeouts):
+- Identify the ANCHOR collection: the one whose filter is most selective
+  (e.g. "the last order this month" = 1 row out of orders). The anchor
+  goes in "collection", and the pipeline MUST narrow it first.
+- "Anchor first, filter early, join late." Order of stages should always
+  be roughly:
+    1. $match on anchor fields (date ranges, status, ids).
+    2. $sort + $limit if the request is "the last/latest/top N".
+    3. $lookup to bring in related rows (use a JOIN RECIPE from the
+       schema digest; do NOT invent join keys).
+    4. $unwind (only after the anchor has been narrowed).
+    5. $project / $group / final $limit.
+- NEVER start with $lookup on a large collection and then $match on the
+  joined field — that scans the entire anchor and joins every row before
+  filtering. The query will time out. Instead, ANCHOR ON THE COLLECTION
+  THE FILTER BELONGS TO and use the reverse JOIN RECIPE.
+- Concrete example for "items of the last order this month":
+    WRONG (timeout):
+      collection: "orderitems"
+      [ $lookup orders, $unwind, $match on joined date, $sort, $limit ]
+    RIGHT (fast):
+      collection: "orders"
+      [ $match {dCreateDate in this month}, $sort {dCreateDate:-1},
+        $limit 1, $lookup orderitems via the reverse recipe,
+        $project the item array, $limit ]
+- Use the JOIN RECIPES section in the schema digest verbatim. If a
+  recipe doesn't exist for the two collections involved, the agent does
+  NOT have permission to invent one — ask a clarifying question.
+
 Self-repair mode:
 - The system message may contain a "Pending execution error" block. That
   is a MongoDB runtime error from the previous report you produced. Your

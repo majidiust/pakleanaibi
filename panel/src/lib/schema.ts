@@ -99,7 +99,13 @@ export async function getSchema(force = false): Promise<SchemaDigest> {
   return digest;
 }
 
-// Compact text form used inside the LLM system prompt.
+// Compact text form used inside the LLM system prompt. We list collections
+// with their fields and -- crucially -- a JOIN RECIPES section that spells
+// out ready-to-paste $lookup stages in BOTH directions for every
+// human-confirmed relationship. The model otherwise tends to invert the
+// natural anchor when the user phrases a question around the "many" side
+// (e.g. "items of the last order") and produce N x M lookups that
+// inevitably time out.
 export function schemaToPrompt(s: SchemaDigest): string {
   const lines: string[] = [`Database: ${s.database}`, `Collections (sorted by row count):`];
   for (const c of s.collections) {
@@ -113,6 +119,25 @@ export function schemaToPrompt(s: SchemaDigest): string {
       const tgt = r.target.matchOn ? `${r.target.collection}.${r.target.matchOn}` : `${r.target.collection}.${r.target.field}`;
       const card = r.cardinality ? ` [${r.cardinality}]` : '';
       lines.push(`- ${r.source.collection}.${r.source.field} -> ${tgt} (${r.type}${card}, ${r.status})`);
+    }
+    // Join recipes: for each relationship, emit the forward and reverse
+    // $lookup templates explicitly. The model can pick either side as the
+    // anchor depending on which collection the request is "about" -- the
+    // PIPELINE PLANNING rules above tell it to anchor where the filters
+    // are most selective.
+    lines.push('', 'JOIN RECIPES (use these exact $lookup shapes; do NOT invent join keys):');
+    for (const r of rels) {
+      const tgtKey = r.target.matchOn ?? r.target.field;
+      // Forward: anchor in source, enrich each row with the target.
+      lines.push(
+        `- Anchor in "${r.source.collection}", attach matching "${r.target.collection}":\n` +
+        `    { "$lookup": { "from": "${r.target.collection}", "localField": "${r.source.field}", "foreignField": "${tgtKey}", "as": "${r.target.collection}_joined" } }`,
+      );
+      // Reverse: anchor in target, attach the many "source" rows.
+      lines.push(
+        `- Anchor in "${r.target.collection}", attach matching "${r.source.collection}":\n` +
+        `    { "$lookup": { "from": "${r.source.collection}", "localField": "${tgtKey}", "foreignField": "${r.source.field}", "as": "${r.source.collection}_joined" } }`,
+      );
     }
   }
   return lines.join('\n');

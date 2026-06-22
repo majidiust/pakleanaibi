@@ -235,8 +235,25 @@ export function lowerPipeline(
       );
     }
     const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(o)) out[k] = walk(v);
+    for (const [k, v] of Object.entries(o)) {
+      // Safety net: when the LLM ignores the EJSON {$date:...} rule and
+      // emits a bare ISO-8601 string as the right-hand side of a date
+      // comparison ($gte/$gt/$lt/$lte/$eq/$ne), coerce it to a real Date
+      // here. Without this, comparing a BSON Date field against a string
+      // silently matches nothing under MongoDB's type bracketing rules.
+      // The pattern is restrictive (full ISO timestamp with seconds and
+      // a Z or offset) so we don't accidentally promote ordinary strings.
+      if (COMP_OPS.has(k) && typeof v === 'string' && ISO_DT.test(v)) {
+        const d = new Date(v);
+        if (!Number.isNaN(d.getTime())) { out[k] = d; continue; }
+      }
+      out[k] = walk(v);
+    }
     return out;
   }
   return pipeline.map(stage => walk(stage) as Record<string, unknown>);
 }
+
+const COMP_OPS = new Set(['$gte', '$gt', '$lt', '$lte', '$eq', '$ne']);
+// Conservative ISO-8601 datetime pattern: YYYY-MM-DDTHH:MM(:SS(.fff))?(Z|+HH:MM).
+const ISO_DT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:?\d{2})$/;

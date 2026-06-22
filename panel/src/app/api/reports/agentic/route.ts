@@ -119,6 +119,40 @@ async function runReport(db: Db, report: LlmReport, version: [number, number]): 
   }
 }
 
+// Add actionable, pattern-specific guidance on top of the raw MongoDB
+// error so the repair turn produces a different PLAN, not just a tweaked
+// version of the same broken one. The raw "exceeded time limit" string
+// has no information the agent can act on otherwise.
+function enrichError(raw: string, broken: LlmReport): string {
+  const lower = raw.toLowerCase();
+  const hints: string[] = [];
+  // Plan-level timeout almost always means the pipeline scanned a large
+  // collection before filtering. Detect the classic anti-pattern and
+  // tell the model how to rewrite it.
+  if (lower.includes('exceeded time limit') || lower.includes('planexecutor') || lower.includes('maxtimems')) {
+    const stages = (broken.pipeline as Record<string, unknown>[]).map(s => Object.keys(s)[0]);
+    const firstLookup = stages.indexOf('$lookup');
+    const firstMatch = stages.indexOf('$match');
+    const anchoredOnLookup = firstLookup >= 0 && (firstMatch === -1 || firstLookup < firstMatch);
+    hints.push(
+      'The query exceeded the execution time limit. This is almost always a PLAN problem, not a syntax problem.',
+      'Re-read the PIPELINE PLANNING rules and the JOIN RECIPES in the schema. Anchor the pipeline on the collection whose filter is MOST SELECTIVE, narrow it FIRST with $match/$sort/$limit, and only THEN $lookup the related rows using the reverse JOIN RECIPE if needed.',
+    );
+    if (anchoredOnLookup) {
+      hints.push(
+        'Your previous pipeline started with $lookup before $match. That scans the entire anchor collection and joins every row before filtering. Swap the anchor: pick the collection that owns the filter field, apply $match + $sort + $limit on it FIRST, then $lookup the other side using the reverse recipe.',
+      );
+    }
+  }
+  if (lower.includes('cannot convert') || lower.includes('failed to parse date') || lower.includes('not a date')) {
+    hints.push(
+      'A date comparison failed because the right-hand side was a string and the left-hand side is a BSON Date (or vice versa). Always emit dates as EJSON {"$date": "<ISO with Z>"} so the driver serialises a real BSON Date.',
+    );
+  }
+  if (hints.length === 0) return raw;
+  return `${raw}\n\nAGENT HINTS:\n- ${hints.join('\n- ')}`;
+}
+
 async function callAgent(
   history: ChatMessage[], lastReport: LlmReport | null, pendingError: string | null,
   digest: SchemaDigest, serverVersion: { major: number; minor: number; raw: string },
@@ -163,7 +197,7 @@ export async function POST(req: Request) {
   // maxRepairs so we never spin.
   let current = attempts[0];
   for (let i = 0; i < maxRepairs && !current.execution.ok; i++) {
-    const errMsg = current.execution.error ?? 'unknown_error';
+    const errMsg = enrichError(current.execution.error ?? 'unknown_error', current.report);
     const next = await callAgent(history2, current.report, errMsg, digest, serverInfo);
     if ('error' in next) {
       break;
