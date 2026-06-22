@@ -1,5 +1,5 @@
 'use client';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   flexRender,
   getCoreRowModel,
@@ -17,6 +17,13 @@ export function DataTable({ rows, title }: { rows: Record<string, unknown>[]; ti
   const [sorting, setSorting] = useState<SortingState>([]);
   const [filter, setFilter] = useState('');
   const [showExport, setShowExport] = useState(false);
+  // Fullscreen toggle. Wide cells (nested mini-tables, $lookup arrays)
+  // would otherwise force the grid column to outgrow its track and crush
+  // the chat panel; expanding lifts the table into a fixed overlay so the
+  // page layout underneath stays intact while the analyst can inspect the
+  // full result. We keep DataTable mounted in both modes so sort/filter/
+  // pagination state survives the toggle.
+  const [expanded, setExpanded] = useState(false);
 
   const columns = useMemo<ColumnDef<Record<string, unknown>>[]>(() => {
     const keys = new Set<string>();
@@ -54,8 +61,28 @@ export function DataTable({ rows, title }: { rows: Record<string, unknown>[]; ti
     [filteredRows],
   );
 
+  // While expanded, treat the overlay like a modal: Esc closes it and the
+  // body scrollbar is suppressed so background scrolling doesn't leak through.
+  useEffect(() => {
+    if (!expanded) return;
+    function onKey(e: KeyboardEvent) { if (e.key === 'Escape') setExpanded(false); }
+    document.addEventListener('keydown', onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.removeEventListener('keydown', onKey); document.body.style.overflow = prev; };
+  }, [expanded]);
+
+  // Two container shapes share the same inner toolbar/table/pagination.
+  // In normal mode the component lives inside its parent layout slot; in
+  // expanded mode it becomes a full-viewport panel with its own card chrome.
+  const outerCls = expanded
+    ? 'fixed inset-0 z-50 bg-bg/95 backdrop-blur-sm flex flex-col p-4 sm:p-6'
+    : 'space-y-3 min-w-0';
+  const innerWrap = expanded ? 'card card-pad flex flex-col flex-1 min-h-0 min-w-0 space-y-3' : '';
+
   return (
-    <div className="space-y-3">
+    <div className={outerCls}>
+      <div className={innerWrap}>
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="relative max-w-xs w-full">
           <svg viewBox="0 0 20 20" className="size-4 absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-2"
@@ -66,6 +93,7 @@ export function DataTable({ rows, title }: { rows: Record<string, unknown>[]; ti
             onChange={e => setFilter(e.target.value)} />
         </div>
         <div className="flex items-center gap-3">
+          {title && expanded && <div className="text-sm font-medium tracking-tightish text-ink truncate max-w-[40ch]">{title}</div>}
           <div className="text-xs text-muted num">
             <span className="text-ink-2 font-medium">{filtered.toLocaleString()}</span>
             <span className="mx-1">of</span>
@@ -79,9 +107,27 @@ export function DataTable({ rows, title }: { rows: Record<string, unknown>[]; ti
             </svg>
             Export
           </button>
+          <button className="btn-ghost btn-sm" onClick={() => setExpanded(e => !e)}
+                  title={expanded ? 'Close fullscreen (Esc)' : 'Expand table to fullscreen'}>
+            {expanded ? (
+              <>
+                <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+                  <path d="M10 6h4M6 6V2M6 10v4M10 10h4" /><path d="M10 6 14 2M6 6 2 2M6 10l-4 4M10 10l4 4" />
+                </svg>
+                Close
+              </>
+            ) : (
+              <>
+                <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+                  <path d="M10 2h4v4M14 2l-5 5M6 14H2v-4M2 14l5-5" />
+                </svg>
+                Expand
+              </>
+            )}
+          </button>
         </div>
       </div>
-      <div className="table-wrap">
+      <div className={'table-wrap' + (expanded ? ' flex-1 min-h-0 overflow-auto' : '')}>
         <table className="bi">
           <thead>
             {table.getHeaderGroups().map(g => (
@@ -137,6 +183,7 @@ export function DataTable({ rows, title }: { rows: Record<string, unknown>[]; ti
           onClose={() => setShowExport(false)}
         />
       )}
+      </div>
     </div>
   );
 }

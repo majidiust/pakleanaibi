@@ -205,7 +205,7 @@ function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, can
 }) {
   if (!report) {
     return (
-      <div className="card card-pad min-h-[460px] grid place-items-center text-center">
+      <div className="card card-pad min-h-[460px] min-w-0 grid place-items-center text-center">
         <div className="space-y-2 max-w-sm">
           <div className="text-muted text-sm">No report yet.</div>
           <div className="text-xs text-muted">
@@ -220,7 +220,7 @@ function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, can
   const rows = execution?.rows;
   const displayKind = report.display?.kind ?? 'table';
   return (
-    <div className="space-y-3">
+    <div className="space-y-3 min-w-0">
       <div className="card card-pad space-y-2">
         <div className="flex items-center justify-between gap-2 flex-wrap">
           <div className="flex items-center gap-2 flex-wrap">
@@ -296,7 +296,7 @@ function ChatPanel({ history, input, busy, chatRef, onInput, onSend, onExample, 
   attached: AttachedField[]; onAttachedChange: (next: AttachedField[]) => void;
 }) {
   return (
-    <div className="card flex flex-col h-[min(720px,calc(100vh-180px))] sticky top-4">
+    <div className="card flex flex-col h-[min(720px,calc(100vh-180px))] sticky top-4 min-w-0">
       <div className="px-4 py-3 border-b border-line flex items-center justify-between">
         <div className="text-sm font-medium tracking-tightish">Conversation</div>
         <span className="text-2xs text-muted">{history.length} message{history.length === 1 ? '' : 's'}</span>
