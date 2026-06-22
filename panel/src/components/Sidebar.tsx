@@ -6,6 +6,7 @@ import clsx from 'clsx';
 const ITEMS = [
   { href: '/dashboard', label: 'Dashboard', icon: '◧' },
   { href: '/reports', label: 'Reports', icon: '✦' },
+  { href: '/intelligence', label: 'Intelligence', icon: '◆' },
   { href: '/users', label: 'Users', icon: '◉' },
   { href: '/account', label: 'Account', icon: '◐' },
 ];
