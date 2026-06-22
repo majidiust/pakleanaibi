@@ -22,6 +22,10 @@ export async function ensureBootstrap(): Promise<void> {
   // keeps the per-op aggregation cheap once the collection grows large.
   await db.collection('llm_usage').createIndex({ ts: -1 });
   await db.collection('llm_usage').createIndex({ op: 1, ts: -1 });
+  // Agentic chat persistence: every user's conversation list is fetched
+  // ordered by updatedAt desc, so a compound (userId, updatedAt) index covers
+  // the common query without a separate sort stage.
+  await db.collection('agentic_conversations').createIndex({ userId: 1, updatedAt: -1 });
 
   const email = env.ADMIN_EMAIL.toLowerCase();
   const existing = await users.findOne({ email });

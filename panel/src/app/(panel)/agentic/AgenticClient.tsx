@@ -4,6 +4,7 @@ import { DataTable } from '@/components/DataTable';
 import { ChartView, type ChartDisplay } from '@/components/ChartView';
 import { SaveTemplateModal } from './SaveTemplateModal';
 import { FieldAttacher, type AttachedField } from './FieldAttacher';
+import { ConversationHistory } from './ConversationHistory';
 
 interface LlmReport {
   collection: string;
@@ -39,7 +40,16 @@ export function AgenticClient() {
   const [savingTemplate, setSavingTemplate] = useState(false);
   const [savedNotice, setSavedNotice] = useState<string | null>(null);
   const [attached, setAttached] = useState<AttachedField[]>([]);
+  // Conversation persistence: created lazily on the first user turn, then
+  // every subsequent change (history or lastReport) is debounced-PATCHed.
+  // `historyRefresh` bumps a key the sidebar listens to so its list reorders
+  // after a save without us having to push state down.
+  const [conversationId, setConversationId] = useState<string | null>(null);
+  const [historyRefresh, setHistoryRefresh] = useState(0);
   const chatRef = useRef<HTMLDivElement>(null);
+  // Tracks the last persisted payload so the autosave effect can skip
+  // identical writes (e.g. when the user merely toggles a UI control).
+  const lastSavedRef = useRef<string>('');
   // Last user-authored prompt; used as the template's `sourcePrompt` so we
   // can show analysts what natural-language ask produced this saved report.
   const lastUserPrompt = [...history].reverse().find(m => m.role === 'user')?.content;
@@ -66,6 +76,26 @@ export function AgenticClient() {
     setInput('');
     setAttached([]);
     setBusy('turn');
+    // Create the conversation lazily on the first user turn. We do this
+    // before the LLM call so the id exists by the time the autosave effect
+    // fires after the assistant response is appended. Failing to create
+    // shouldn't block the chat itself — the user can still get a reply,
+    // it just won't be persisted.
+    let cid = conversationId;
+    if (!cid) {
+      try {
+        const cr = await fetch('/api/agentic/conversations', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ history: nextHist }),
+        });
+        if (cr.ok) {
+          const cj = await cr.json() as { id: string };
+          cid = cj.id;
+          setConversationId(cj.id);
+          setHistoryRefresh(n => n + 1);
+        }
+      } catch { /* see above — non-fatal */ }
+    }
     try {
       // Send only the recent slice of the conversation. The server applies
       // its own window too, but trimming here keeps payloads small and
@@ -117,7 +147,55 @@ export function AgenticClient() {
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'request failed');
     } finally { setBusy(null); }
-  }, [history, report, busy, attached]);
+  }, [history, report, busy, attached, conversationId]);
+
+  // Autosave: whenever the conversation has been created and the history /
+  // last report change, PATCH the server after a short debounce. Skips
+  // identical payloads (`lastSavedRef`) so re-renders that don't actually
+  // change persisted data don't trigger writes.
+  useEffect(() => {
+    if (!conversationId || history.length === 0) return;
+    const payload = JSON.stringify({ history, lastReport: report });
+    if (payload === lastSavedRef.current) return;
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const r = await fetch(`/api/agentic/conversations/${conversationId}`, {
+            method: 'PATCH', headers: { 'content-type': 'application/json' },
+            body: payload,
+          });
+          if (r.ok) {
+            lastSavedRef.current = payload;
+            // Nudge the sidebar so updatedAt ordering reflects the save.
+            setHistoryRefresh(n => n + 1);
+          }
+        } catch { /* network blip — next change will retry */ }
+      })();
+    }, 1200);
+    return () => clearTimeout(timer);
+  }, [history, report, conversationId]);
+
+  // Load an existing conversation into the local state, replacing whatever
+  // is currently in view. `setExecution(null)` because we deliberately don't
+  // persist row data — the user re-runs ▶ Execute to refresh it.
+  const loadConversation = useCallback(async (id: string) => {
+    setErr(null);
+    try {
+      const r = await fetch(`/api/agentic/conversations/${id}`);
+      if (!r.ok) { setErr('Failed to load conversation'); return; }
+      const j = await r.json() as { id: string; history: ChatMsg[]; lastReport: LlmReport | null };
+      setConversationId(j.id);
+      setHistory(j.history ?? []);
+      setReport(j.lastReport ?? null);
+      setExecution(null);
+      setInput(''); setAttached([]);
+      // Seed lastSavedRef so the autosave effect doesn't immediately rewrite
+      // the freshly-loaded payload back to the server.
+      lastSavedRef.current = JSON.stringify({ history: j.history ?? [], lastReport: j.lastReport ?? null });
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'failed to load');
+    }
+  }, []);
 
   const executeReport = useCallback(async () => {
     if (!report || busy) return;
@@ -142,8 +220,10 @@ export function AgenticClient() {
   }, [report, busy]);
 
   function resetSession() {
-    if (!confirm('Start a new conversation? Current report and chat will be cleared.')) return;
+    if (history.length > 0 && !confirm('Start a new conversation? The current one is already saved in History.')) return;
     setHistory([]); setReport(null); setExecution(null); setErr(null); setInput(''); setAttached([]);
+    setConversationId(null);
+    lastSavedRef.current = '';
   }
 
   return (
@@ -155,7 +235,23 @@ export function AgenticClient() {
             Converse with the AI to build, refine and execute reports. Results appear on the left.
           </p>
         </div>
-        <button className="btn-ghost btn-sm" onClick={resetSession} disabled={history.length === 0}>↻ New session</button>
+        <div className="flex items-center gap-2">
+          <ConversationHistory
+            currentId={conversationId}
+            refreshKey={historyRefresh}
+            onLoad={loadConversation}
+            onDeleted={(id) => {
+              // If the user deleted the conversation they're currently
+              // looking at, clear local state so we don't keep PATCHing a
+              // tombstone.
+              if (id === conversationId) {
+                setConversationId(null); setHistory([]); setReport(null);
+                setExecution(null); setInput(''); setAttached([]); lastSavedRef.current = '';
+              }
+            }}
+          />
+          <button className="btn-ghost btn-sm" onClick={resetSession} disabled={history.length === 0 && conversationId === null}>↻ New</button>
+        </div>
       </div>
 
       {err && <div className="card card-pad text-err text-sm whitespace-pre-wrap">{err}</div>}
