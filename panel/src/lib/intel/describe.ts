@@ -4,6 +4,7 @@
 import OpenAI from 'openai';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { env } from '../env';
+import { recordUsage } from '../llm-cost';
 import type { FieldSample, IntelCollection } from './types';
 
 interface DescribeInput { name: string; tags: string[]; fields: FieldSample[]; docCount: number }
@@ -126,6 +127,7 @@ export async function describeCollections(collections: IntelCollection[]):
   for (let i = 0; i < pending.length; i += CHUNK) {
     const batch = pending.slice(i, i + CHUNK);
     try {
+      const t0 = Date.now();
       const resp = await client().chat.completions.create({
         model: env.OPENAI_MODEL, temperature: 0.2,
         messages: [
@@ -133,6 +135,12 @@ export async function describeCollections(collections: IntelCollection[]):
           { role: 'user', content: compactPrompt(batch) },
         ],
         response_format: { type: 'json_schema', json_schema: { name: 'descriptions', schema: RESP_SCHEMA, strict: false } },
+      });
+      void recordUsage({
+        op: 'intel.describe', model: resp.model ?? env.OPENAI_MODEL,
+        promptTokens: resp.usage?.prompt_tokens ?? 0,
+        completionTokens: resp.usage?.completion_tokens ?? 0,
+        durationMs: Date.now() - t0,
       });
       const content = resp.choices[0]?.message?.content;
       const parsed = content ? JSON.parse(content) as { items: { name: string; entity: string; description: string }[] } : null;

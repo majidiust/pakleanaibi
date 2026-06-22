@@ -17,6 +17,11 @@ export async function ensureBootstrap(): Promise<void> {
   await users.createIndex({ email: 1 }, { unique: true });
   await db.collection('schema_cache').createIndex({ key: 1 }, { unique: true });
   await db.collection('reports').createIndex({ createdAt: -1 });
+  // LLM usage ledger: dashboard reads recent-by-ts and groups by op / model,
+  // so a descending ts index covers the recents query and a (op, ts) index
+  // keeps the per-op aggregation cheap once the collection grows large.
+  await db.collection('llm_usage').createIndex({ ts: -1 });
+  await db.collection('llm_usage').createIndex({ op: 1, ts: -1 });
 
   const email = env.ADMIN_EMAIL.toLowerCase();
   const existing = await users.findOne({ email });

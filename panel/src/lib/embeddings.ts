@@ -1,4 +1,5 @@
 import { env } from './env';
+import { recordUsage } from './llm-cost';
 
 // Pluggable embedding provider used only by the report cache to find
 // semantically-similar past questions. Keeping the interface tiny so we can
@@ -48,6 +49,7 @@ async function embedHF(text: string): Promise<EmbeddingResult | null> {
 
 async function embedOpenAI(text: string): Promise<EmbeddingResult | null> {
   try {
+    const t0 = Date.now();
     const r = await fetch('https://api.openai.com/v1/embeddings', {
       method: 'POST',
       headers: {
@@ -57,9 +59,18 @@ async function embedOpenAI(text: string): Promise<EmbeddingResult | null> {
       body: JSON.stringify({ model: 'text-embedding-3-small', input: text }),
     });
     if (!r.ok) return null;
-    const data = await r.json() as { data?: { embedding: number[] }[] };
+    const data = await r.json() as {
+      data?: { embedding: number[] }[];
+      model?: string;
+      usage?: { prompt_tokens?: number; total_tokens?: number };
+    };
     const vec = data?.data?.[0]?.embedding;
     if (!Array.isArray(vec)) return null;
+    void recordUsage({
+      op: 'embed', model: data.model ?? 'text-embedding-3-small',
+      promptTokens: data.usage?.prompt_tokens ?? 0, completionTokens: 0,
+      durationMs: Date.now() - t0,
+    });
     return { vector: vec, model: 'text-embedding-3-small' };
   } catch {
     return null;

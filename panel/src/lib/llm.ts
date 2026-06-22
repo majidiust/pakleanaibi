@@ -2,6 +2,7 @@ import OpenAI from 'openai';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { env } from './env';
 import { schemaToPrompt, type SchemaDigest } from './schema';
+import { recordUsage } from './llm-cost';
 
 // ----- OpenAI client (singleton; optional SOCKS5 proxy support) -------------
 let _client: OpenAI | null = null;
@@ -90,6 +91,7 @@ const SCHEMA = {
 
 export async function generateReport(question: string, digest: SchemaDigest): Promise<LlmReport> {
   const c = client();
+  const t0 = Date.now();
   const resp = await c.chat.completions.create({
     model: env.OPENAI_MODEL,
     temperature: 0.1,
@@ -102,6 +104,12 @@ export async function generateReport(question: string, digest: SchemaDigest): Pr
       type: 'json_schema',
       json_schema: { name: 'report', schema: SCHEMA, strict: false },
     },
+  });
+  void recordUsage({
+    op: 'report.generate', model: resp.model ?? env.OPENAI_MODEL,
+    promptTokens: resp.usage?.prompt_tokens ?? 0,
+    completionTokens: resp.usage?.completion_tokens ?? 0,
+    durationMs: Date.now() - t0,
   });
   const content = resp.choices[0]?.message?.content;
   if (!content) throw new Error('LLM returned empty response');
@@ -280,6 +288,7 @@ function contextToPrompt(ctx: DiscoverContext): string {
 
 export async function discoverRelationshipsFromConversation(ctx: DiscoverContext): Promise<DiscoverReply> {
   const c = client();
+  const t0 = Date.now();
   const resp = await c.chat.completions.create({
     model: env.OPENAI_MODEL,
     temperature: 0.2,
@@ -292,6 +301,12 @@ export async function discoverRelationshipsFromConversation(ctx: DiscoverContext
       type: 'json_schema',
       json_schema: { name: 'discover', schema: DISCOVER_SCHEMA, strict: false },
     },
+  });
+  void recordUsage({
+    op: 'intel.discover', model: resp.model ?? env.OPENAI_MODEL,
+    promptTokens: resp.usage?.prompt_tokens ?? 0,
+    completionTokens: resp.usage?.completion_tokens ?? 0,
+    durationMs: Date.now() - t0,
   });
   const content = resp.choices[0]?.message?.content;
   if (!content) throw new Error('LLM returned empty response');
@@ -609,6 +624,7 @@ export async function agenticReport(ctx: AgenticContext, digest: SchemaDigest): 
       ? `Pending execution error from the previous report — diagnose and emit a CORRECTED report this turn:\n${ctx.pendingError}`
       : '',
   ].filter(Boolean).join('\n\n');
+  const t0 = Date.now();
   const resp = await c.chat.completions.create({
     model: env.OPENAI_MODEL,
     temperature: 0.15,
@@ -621,6 +637,12 @@ export async function agenticReport(ctx: AgenticContext, digest: SchemaDigest): 
       type: 'json_schema',
       json_schema: { name: 'agentic_turn', schema: AGENTIC_SCHEMA, strict: false },
     },
+  });
+  void recordUsage({
+    op: 'report.agentic', model: resp.model ?? env.OPENAI_MODEL,
+    promptTokens: resp.usage?.prompt_tokens ?? 0,
+    completionTokens: resp.usage?.completion_tokens ?? 0,
+    durationMs: Date.now() - t0,
   });
   const content = resp.choices[0]?.message?.content;
   if (!content) throw new Error('LLM returned empty response');
@@ -641,6 +663,7 @@ export async function repairReport(ctx: RepairContext, digest: SchemaDigest): Pr
     ctx.refinement ? `User refinement instruction (any language):\n${ctx.refinement}` : '',
   ].filter(Boolean).join('\n\n');
 
+  const t0 = Date.now();
   const resp = await c.chat.completions.create({
     model: env.OPENAI_MODEL,
     temperature: 0.1,
@@ -654,6 +677,12 @@ export async function repairReport(ctx: RepairContext, digest: SchemaDigest): Pr
       type: 'json_schema',
       json_schema: { name: 'report', schema: SCHEMA, strict: false },
     },
+  });
+  void recordUsage({
+    op: 'report.repair', model: resp.model ?? env.OPENAI_MODEL,
+    promptTokens: resp.usage?.prompt_tokens ?? 0,
+    completionTokens: resp.usage?.completion_tokens ?? 0,
+    durationMs: Date.now() - t0,
   });
   const content = resp.choices[0]?.message?.content;
   if (!content) throw new Error('LLM returned empty response');
