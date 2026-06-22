@@ -145,6 +145,290 @@ export interface RepairContext {
   refinement?: string;
 }
 
+// ----- Conversational relationship discovery ------------------------------
+// The assistant takes a focused collection (its fields, examples, current
+// description) plus a compact view of every other collection in the database
+// and a chat history. It returns the next assistant message AND any
+// relationship suggestions it has gathered so far. The user can approve each
+// suggestion individually; the assistant keeps asking until it has nothing
+// useful left to ask (signals via `done`).
+
+export type ChatRole = 'user' | 'assistant';
+export interface ChatMessage { role: ChatRole; content: string }
+
+export interface RelSuggestion {
+  source: { collection: string; field: string };
+  target: { collection: string; field: string; matchOn?: string };
+  type: 'one-to-one' | 'one-to-many' | 'many-to-one' | 'many-to-many' | 'embedded' | 'soft' | 'derived' | 'chain';
+  cardinality?: '1:1' | '1:N' | 'N:1' | 'N:N';
+  confidence: number;
+  reason: string;
+  signals?: string[];
+}
+
+export interface DiscoverContext {
+  focused: {
+    name: string;
+    description?: string;
+    docCount: number;
+    fields: { path: string; types: string[]; presence: number; examples?: unknown[]; arrayOf?: string[] }[];
+  };
+  others: { name: string; entity?: string; description?: string; idFields: string[]; docCount: number }[];
+  existing: { source: string; target: string; type: string; status: string }[];
+  history: ChatMessage[];
+}
+
+export interface DiscoverReply {
+  message: string;
+  suggestions: RelSuggestion[];
+  done: boolean;
+}
+
+const DISCOVER_SYSTEM = `You are a senior data architect helping a user map relationships in their MongoDB database.
+
+You are focused on one collection at a time. The user has written a short description (in any
+language) of what the collection represents. Your job is an interactive Q&A:
+
+1. Read the focused collection's fields + examples and the names/identifiers of every other
+   collection.
+2. Identify candidate foreign-key fields (ObjectIds, *_id, *_ref, embedded references, arrays
+   of ids, etc.) AND domain links the user might know (e.g. "transactions belong to the wallet
+   referenced by walletId").
+3. For each candidate, decide if you already have enough evidence to suggest a relationship.
+   If yes, emit it in the "suggestions" array with confidence and reason.
+4. If you are unsure about a candidate, DO NOT suggest it; instead ask ONE concise clarifying
+   question in the "message" field. Ask about one or two ambiguous fields per turn, not all of
+   them.
+5. When you believe every plausible foreign key has been covered (suggested, ruled out, or
+   confirmed not-a-relationship by the user), set "done": true and write a short summary in
+   "message".
+
+Hard rules:
+- Output JSON only, matching the supplied JSON schema.
+- "message" MUST be in the same language as the user's most recent message. Field and
+  collection names stay in English exactly as in the schema.
+- "source.collection" MUST equal the focused collection. "target.collection" MUST be one of
+  the listed other collections (never invent a collection name).
+- "source.field" / "target.field" MUST exist in the supplied schema (use dot notation for
+  nested fields).
+- Each "suggestions" entry should be NEW (the user has not yet seen it in this conversation),
+  or a refinement requested by the user. Do not repeat suggestions the user already
+  approved/rejected.
+- "confidence" is 0-100 based on evidence: ObjectId-typed FK with matching name -> 80-95;
+  soft string/number FK with strong naming -> 50-75; user confirmation -> 90-100;
+  speculative -> 30-50 (and you should usually ASK instead of suggesting).
+- "reason" is one sentence in the user's language explaining the evidence.`;
+
+const DISCOVER_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['message', 'suggestions', 'done'],
+  properties: {
+    message: { type: 'string' },
+    done: { type: 'boolean' },
+    suggestions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['source', 'target', 'type', 'confidence', 'reason'],
+        properties: {
+          source: {
+            type: 'object', additionalProperties: false, required: ['collection', 'field'],
+            properties: { collection: { type: 'string' }, field: { type: 'string' } },
+          },
+          target: {
+            type: 'object', additionalProperties: false, required: ['collection', 'field'],
+            properties: {
+              collection: { type: 'string' }, field: { type: 'string' },
+              matchOn: { type: 'string' },
+            },
+          },
+          type: { type: 'string', enum: ['one-to-one','one-to-many','many-to-one','many-to-many','embedded','soft','derived','chain'] },
+          cardinality: { type: 'string', enum: ['1:1','1:N','N:1','N:N'] },
+          confidence: { type: 'number' },
+          reason: { type: 'string' },
+          signals: { type: 'array', items: { type: 'string' } },
+        },
+      },
+    },
+  },
+} as const;
+
+function contextToPrompt(ctx: DiscoverContext): string {
+  const f = ctx.focused;
+  const fields = f.fields.map(x => {
+    const t = x.arrayOf ? `array<${x.arrayOf.join('|')}>` : x.types.join('|');
+    const ex = x.examples?.length ? `  examples=${JSON.stringify(x.examples.slice(0, 2))}` : '';
+    return `  - ${x.path}: ${t} (presence=${(x.presence * 100).toFixed(0)}%)${ex}`;
+  }).join('\n');
+  const others = ctx.others.map(o =>
+    `  - ${o.name}${o.entity ? ` [${o.entity}]` : ''} (~${o.docCount} docs)  ids=${o.idFields.join(',') || '_id'}`
+    + (o.description ? `\n    desc: ${o.description}` : ''),
+  ).join('\n');
+  const existing = ctx.existing.length
+    ? ctx.existing.map(e => `  - ${e.source} -> ${e.target} (${e.type}, ${e.status})`).join('\n')
+    : '  (none)';
+  return [
+    `Focused collection: ${f.name} (~${f.docCount} docs)`,
+    f.description ? `User-provided description:\n  ${f.description}` : 'User-provided description: (empty)',
+    `Fields:\n${fields || '  (none)'}`,
+    `Other collections in the database:\n${others || '  (none)'}`,
+    `Existing approved/manual relationships involving this collection:\n${existing}`,
+  ].join('\n\n');
+}
+
+export async function discoverRelationshipsFromConversation(ctx: DiscoverContext): Promise<DiscoverReply> {
+  const c = client();
+  const resp = await c.chat.completions.create({
+    model: env.OPENAI_MODEL,
+    temperature: 0.2,
+    messages: [
+      { role: 'system', content: DISCOVER_SYSTEM },
+      { role: 'system', content: contextToPrompt(ctx) },
+      ...ctx.history.map(m => ({ role: m.role, content: m.content })),
+    ],
+    response_format: {
+      type: 'json_schema',
+      json_schema: { name: 'discover', schema: DISCOVER_SCHEMA, strict: false },
+    },
+  });
+  const content = resp.choices[0]?.message?.content;
+  if (!content) throw new Error('LLM returned empty response');
+  let parsed: unknown;
+  try { parsed = JSON.parse(content); } catch { throw new Error('LLM output was not valid JSON'); }
+  const out = parsed as DiscoverReply;
+  // Defensive defaults.
+  out.suggestions = Array.isArray(out.suggestions) ? out.suggestions : [];
+  out.done = !!out.done;
+  out.message = String(out.message ?? '');
+  return out;
+}
+
+// ----- Agentic (multi-turn) reporting -------------------------------------
+// One turn of a conversation that ultimately produces an LlmReport. The
+// assistant decides whether it has enough information to emit a final
+// pipeline (kind='report') or needs to ask one clarifying question
+// (kind='question'). It may also revise a previously emitted report when
+// the user asks for changes.
+
+export interface AgenticTurn {
+  kind: 'question' | 'report';
+  message: string;       // Free-form text shown in the chat panel.
+  report?: LlmReport;    // Present iff kind='report'.
+}
+
+const AGENTIC_SYSTEM = `You are a senior BI analyst running an interactive reporting session over a
+MongoDB database. Each turn you receive: the schema digest, the full chat
+history, and (optionally) the last report you produced.
+
+Your job, per turn, is to decide ONE of:
+  (a) Ask the user ONE focused clarifying question because the request is
+      ambiguous (time range unclear, grouping unclear, metric unclear,
+      which collection/entity, filter values, etc.). Output kind="question"
+      with the question in "message". Do NOT include a report.
+  (b) Produce or revise a final read-only aggregation pipeline because you
+      have enough information. Output kind="report" with a short summary
+      in "message" AND the full report object in "report".
+
+Rules for choice:
+- Prefer asking when more than one reasonable interpretation exists and the
+  difference materially changes the result. Otherwise produce the report
+  and explain assumptions in "message".
+- Ask AT MOST one question per turn. Keep it under ~25 words.
+- After the user has answered enough to disambiguate, switch to producing
+  the report — do not keep asking.
+- When the user follows up on an existing report ("change to weekly",
+  "filter only Iran", "show as bar chart"), revise the previous report and
+  return kind="report".
+
+Constraints on report output (when kind="report"):
+- "collection" and field names must exist in the schema (English, exact).
+- Allowed stages only: $match, $project, $group, $sort, $limit, $skip,
+  $count, $addFields, $set, $unset, $unwind, $replaceRoot, $replaceWith,
+  $bucket, $bucketAuto, $facet, $sortByCount, $lookup, $densify.
+- Forbidden: $out, $merge, $function, $accumulator, $where, evaluation
+  operators. No JavaScript strings.
+- Always include an explicit final $limit (<= max rows).
+- Use ISO date math via $dateFromString / $dateTrunc when grouping by time.
+- Pick a display.kind that matches the shape ("bar" / "line" / "pie" /
+  "area" / "table") with appropriate xField / yField.
+
+Language:
+- "message" MUST be in the same language as the user's most recent message
+  (Persian/Farsi, Arabic, English, ...). Field, collection and operator
+  names stay in English as in the schema.`;
+
+const AGENTIC_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['kind', 'message'],
+  properties: {
+    kind: { type: 'string', enum: ['question', 'report'] },
+    message: { type: 'string' },
+    report: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['collection', 'pipeline', 'display', 'explanation'],
+      properties: {
+        collection: { type: 'string' },
+        pipeline: { type: 'array', items: { type: 'object' } },
+        display: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['kind'],
+          properties: {
+            kind: { type: 'string', enum: ['table', 'bar', 'line', 'pie', 'area'] },
+            xField: { type: 'string' },
+            yField: { type: 'string' },
+            seriesField: { type: 'string' },
+            title: { type: 'string' },
+          },
+        },
+        explanation: { type: 'string' },
+        warnings: { type: 'array', items: { type: 'string' } },
+      },
+    },
+  },
+} as const;
+
+export interface AgenticContext {
+  history: ChatMessage[];
+  lastReport?: LlmReport | null;
+}
+
+export async function agenticReport(ctx: AgenticContext, digest: SchemaDigest): Promise<AgenticTurn> {
+  const c = client();
+  const sysCtx = [
+    `Max rows: ${env.REPORT_MAX_ROWS}.`,
+    `Schema digest:\n${schemaToPrompt(digest)}`,
+    ctx.lastReport
+      ? `Previous report (you may revise this if the user asks):\n${JSON.stringify(ctx.lastReport, null, 2)}`
+      : 'No previous report yet in this session.',
+  ].join('\n\n');
+  const resp = await c.chat.completions.create({
+    model: env.OPENAI_MODEL,
+    temperature: 0.15,
+    messages: [
+      { role: 'system', content: AGENTIC_SYSTEM },
+      { role: 'system', content: sysCtx },
+      ...ctx.history.map(m => ({ role: m.role, content: m.content })),
+    ],
+    response_format: {
+      type: 'json_schema',
+      json_schema: { name: 'agentic_turn', schema: AGENTIC_SCHEMA, strict: false },
+    },
+  });
+  const content = resp.choices[0]?.message?.content;
+  if (!content) throw new Error('LLM returned empty response');
+  let parsed: unknown;
+  try { parsed = JSON.parse(content); } catch { throw new Error('LLM output was not valid JSON'); }
+  const out = parsed as AgenticTurn;
+  out.message = String(out.message ?? '');
+  if (out.kind === 'report' && !out.report) throw new Error('LLM returned kind=report without a report object');
+  return out;
+}
+
 export async function repairReport(ctx: RepairContext, digest: SchemaDigest): Promise<LlmReport> {
   const c = client();
   const context = [

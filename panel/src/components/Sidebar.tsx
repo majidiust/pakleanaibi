@@ -21,6 +21,14 @@ const Icon = {
       <path d="M3 16V8M7.5 16V4M12 16v-6M16.5 16v-9" />
     </svg>
   ),
+  Agentic: (p: IconProps) => (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" {...p}>
+      <path d="M3.5 5.5h9a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H7l-3 2.5v-2.5a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2z" />
+      <circle cx="6" cy="9" r="0.6" fill="currentColor" />
+      <circle cx="9" cy="9" r="0.6" fill="currentColor" />
+      <path d="M15.5 4.5l1 2 2 1-2 1-1 2-1-2-2-1 2-1z" />
+    </svg>
+  ),
   Intelligence: (p: IconProps) => (
     <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" {...p}>
       <circle cx="5" cy="5" r="2.2" /><circle cx="15" cy="5" r="2.2" />
@@ -43,6 +51,7 @@ const Icon = {
 const ITEMS = [
   { href: '/dashboard',    label: 'Dashboard',    Icon: Icon.Dashboard },
   { href: '/reports',      label: 'Reports',      Icon: Icon.Reports },
+  { href: '/agentic',      label: 'Agentic Report', Icon: Icon.Agentic },
   { href: '/intelligence', label: 'Intelligence', Icon: Icon.Intelligence },
   { href: '/users',        label: 'Users',        Icon: Icon.Users },
   { href: '/account',      label: 'Account',      Icon: Icon.Account },

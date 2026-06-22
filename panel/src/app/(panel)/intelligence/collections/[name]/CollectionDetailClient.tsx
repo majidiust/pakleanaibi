@@ -3,6 +3,7 @@ import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { IntelTabs, PageHeader, Confidence, StatusBadge, TypeBadge } from '../../_ui';
 import { CollectionDataBrowser } from './CollectionDataBrowser';
+import { RelationshipAssistant } from './RelationshipAssistant';
 
 interface Field {
   path: string; types: string[]; arrayOf?: string[]; presence: number;
@@ -153,6 +154,15 @@ export function CollectionDetailClient({ name, role }: { name: string; role: str
             ))}
           </tbody>
         </table></div>
+      </Section>
+
+      <Section title="Relationship assistant">
+        <RelationshipAssistant
+          name={c.name}
+          initialDescription={c.description ?? ''}
+          canEdit={role === 'admin'}
+          onRelationshipApproved={() => void load()}
+        />
       </Section>
 
       <Section title="Outgoing relationships">
