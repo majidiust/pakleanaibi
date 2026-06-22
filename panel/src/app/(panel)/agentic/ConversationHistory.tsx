@@ -1,5 +1,6 @@
 'use client';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { exportConversation, type ExportableConversation, type ExportUser } from './exportConversation';
 
 export interface ConversationSummary {
   id: string;
@@ -31,11 +32,14 @@ function relTime(iso: string): string {
   return new Date(iso).toISOString().slice(0, 10);
 }
 
-export function ConversationHistory({ currentId, refreshKey, onLoad, onDeleted }: {
+export function ConversationHistory({ currentId, refreshKey, user, onLoad, onDeleted }: {
   currentId: string | null;
   // Bumping refreshKey from the parent forces a re-list. Used after a new
   // conversation is created or after an autosave so the timestamps stay live.
   refreshKey: number;
+  // Logged-in user — used to stamp the filename and the header of exported
+  // .txt transcripts so analysts can tell whose export they're looking at.
+  user: ExportUser;
   onLoad: (id: string) => void | Promise<void>;
   onDeleted: (id: string) => void;
 }) {
@@ -73,6 +77,19 @@ export function ConversationHistory({ currentId, refreshKey, onLoad, onDeleted }
     if (!r.ok) { alert('Failed to delete'); return; }
     setItems(prev => prev?.filter(c => c.id !== id) ?? null);
     onDeleted(id);
+  }
+
+  // Per-row export: hydrate the full conversation (the list view drops
+  // `history` + `lastReport` for payload size) and stream it as a .txt.
+  async function handleExport(id: string) {
+    try {
+      const r = await fetch(`/api/agentic/conversations/${id}`);
+      if (!r.ok) { alert('Failed to load conversation for export'); return; }
+      const j = await r.json() as ExportableConversation;
+      exportConversation(j, user);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Export failed');
+    }
   }
 
   const count = items?.length ?? 0;
@@ -118,11 +135,20 @@ export function ConversationHistory({ currentId, refreshKey, onLoad, onDeleted }
                     {c.id === currentId && <span className="text-accent-hi">· current</span>}
                   </div>
                 </div>
-                <button
-                  type="button"
-                  className="opacity-0 group-hover:opacity-100 text-muted hover:text-err text-xs"
-                  onClick={(e) => { e.stopPropagation(); void handleDelete(c.id); }}
-                  aria-label="Delete conversation">✕</button>
+                <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100">
+                  <button
+                    type="button"
+                    className="text-muted hover:text-ink text-xs"
+                    onClick={(e) => { e.stopPropagation(); void handleExport(c.id); }}
+                    title="Export as .txt"
+                    aria-label="Export conversation">⤓</button>
+                  <button
+                    type="button"
+                    className="text-muted hover:text-err text-xs"
+                    onClick={(e) => { e.stopPropagation(); void handleDelete(c.id); }}
+                    title="Delete conversation"
+                    aria-label="Delete conversation">✕</button>
+                </div>
               </div>
             ))}
           </div>

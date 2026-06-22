@@ -5,6 +5,7 @@ import { ChartView, type ChartDisplay } from '@/components/ChartView';
 import { SaveTemplateModal } from './SaveTemplateModal';
 import { FieldAttacher, type AttachedField } from './FieldAttacher';
 import { ConversationHistory } from './ConversationHistory';
+import { exportConversation, type ExportableConversation, type ExportUser } from './exportConversation';
 
 interface LlmReport {
   collection: string;
@@ -30,7 +31,7 @@ const EXAMPLES = [
   'How many orders are in each status? Pie chart please.',
 ];
 
-export function AgenticClient() {
+export function AgenticClient({ user }: { user: ExportUser }) {
   const [history, setHistory] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState<'turn' | 'exec' | null>(null);
@@ -226,6 +227,23 @@ export function AgenticClient() {
     lastSavedRef.current = '';
   }
 
+  // Export the conversation that's currently in view as a .txt file. Uses
+  // local state so it works even before the autosave PATCH has finished —
+  // the user doesn't have to wait for the round-trip to download a fresh
+  // transcript.
+  const exportCurrent = useCallback(() => {
+    if (history.length === 0) return;
+    const conv: ExportableConversation = {
+      id: conversationId ?? '(unsaved)',
+      title: [...history].find(m => m.role === 'user')?.content?.slice(0, 80) ?? 'Untitled',
+      history,
+      lastReport: report,
+      createdAt: null,
+      updatedAt: new Date().toISOString(),
+    };
+    exportConversation(conv, user);
+  }, [history, report, conversationId, user]);
+
   return (
     <div className="space-y-4">
       <div className="flex items-end justify-between gap-3 flex-wrap">
@@ -239,6 +257,7 @@ export function AgenticClient() {
           <ConversationHistory
             currentId={conversationId}
             refreshKey={historyRefresh}
+            user={user}
             onLoad={loadConversation}
             onDeleted={(id) => {
               // If the user deleted the conversation they're currently
@@ -250,6 +269,13 @@ export function AgenticClient() {
               }
             }}
           />
+          <button
+            className="btn-ghost btn-sm"
+            onClick={exportCurrent}
+            disabled={history.length === 0}
+            title="Export this conversation as a .txt file">
+            ⤓ Export
+          </button>
           <button className="btn-ghost btn-sm" onClick={resetSession} disabled={history.length === 0 && conversationId === null}>↻ New</button>
         </div>
       </div>

@@ -15,5 +15,5 @@ export default async function AgenticPage() {
       </div>
     );
   }
-  return <AgenticClient />;
+  return <AgenticClient user={{ name: u.name, email: u.email }} />;
 }
