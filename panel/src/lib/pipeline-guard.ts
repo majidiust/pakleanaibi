@@ -19,6 +19,23 @@ export interface ValidatedPipeline {
   pipeline: Record<string, unknown>[];
 }
 
+// Recursively normalize object keys: trim surrounding whitespace, fold any
+// internal whitespace before a `$` so `" $first"` / `"$ first"` / `"$first "`
+// all become `"$first"`. LLMs occasionally insert leading spaces before
+// accumulator operators (which MongoDB then rejects with "must be an
+// accumulator object").
+function sanitizeKeys(node: unknown): unknown {
+  if (node === null || typeof node !== 'object') return node;
+  if (Array.isArray(node)) return node.map(sanitizeKeys);
+  const out: Record<string, unknown> = {};
+  for (const [rawK, v] of Object.entries(node as Record<string, unknown>)) {
+    let k = rawK.trim();
+    if (k.startsWith('$')) k = '$' + k.slice(1).replace(/\s+/g, '');
+    out[k] = sanitizeKeys(v);
+  }
+  return out;
+}
+
 function deepCheck(node: unknown, path: string): void {
   if (node === null || typeof node !== 'object') return;
   if (Array.isArray(node)) { node.forEach((c, i) => deepCheck(c, `${path}[${i}]`)); return; }
@@ -44,9 +61,13 @@ export function validatePipeline(input: {
   if (input.pipeline.length === 0) throw new Error('pipeline must not be empty');
   if (input.pipeline.length > 24) throw new Error('pipeline too long');
 
+  // Sanitize keys (trim whitespace, fold internal whitespace after $) BEFORE
+  // any other check — see comment on sanitizeKeys above.
+  const normalized = sanitizeKeys(input.pipeline) as unknown[];
+
   const out: Record<string, unknown>[] = [];
-  for (let i = 0; i < input.pipeline.length; i++) {
-    const stage = input.pipeline[i];
+  for (let i = 0; i < normalized.length; i++) {
+    const stage = normalized[i];
     if (!stage || typeof stage !== 'object' || Array.isArray(stage)) {
       throw new Error(`stage[${i}] must be an object`);
     }

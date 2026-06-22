@@ -109,3 +109,68 @@ export async function generateReport(question: string, digest: SchemaDigest): Pr
   try { parsed = JSON.parse(content); } catch { throw new Error('LLM output was not valid JSON'); }
   return parsed as LlmReport;
 }
+
+// ----- Repair / refine ------------------------------------------------------
+// Used when a previously generated pipeline either (a) failed during
+// MongoDB execution, or (b) the user provided a refinement instruction.
+
+const REPAIR_SYSTEM = `You are a senior BI analyst fixing a broken MongoDB aggregation pipeline.
+
+You will receive:
+- The original natural-language question (any language).
+- The previous JSON answer you produced (collection, pipeline, display, explanation).
+- Either: a runtime error message from MongoDB, OR a refinement instruction from the user.
+
+Diagnose the failure or instruction, then return a CORRECTED full JSON answer
+matching the same schema. Follow ALL constraints from the base system message
+(allowed stages, no $out / $merge / $function, final $limit, never invent
+fields, use exact English schema names, etc.).
+
+When fixing errors, common pitfalls to consider:
+- Wrong/non-existent field — pick the closest field from the schema.
+- "must be an accumulator object" — use $sum, $avg, $first, $last, $min, $max,
+  $push, $addToSet inside $group; never leading whitespace on operators.
+- Type mismatch — wrap strings with $toDate, $toInt, etc. as needed.
+- $lookup join key mismatch — use ObjectId vs string consistently.
+- Date math — use $dateSubtract / $dateTrunc / $dateFromString, never JS Date.
+
+Write the "explanation" in the same language as the question and briefly
+describe what was changed and why (1\u20132 sentences).`;
+
+export interface RepairContext {
+  question: string;
+  previous: LlmReport;
+  // Provide exactly one of `error` or `refinement`.
+  error?: string;
+  refinement?: string;
+}
+
+export async function repairReport(ctx: RepairContext, digest: SchemaDigest): Promise<LlmReport> {
+  const c = client();
+  const context = [
+    `Original question: ${ctx.question}`,
+    `Previous answer (JSON):\n${JSON.stringify(ctx.previous, null, 2)}`,
+    ctx.error      ? `MongoDB error:\n${ctx.error}` : '',
+    ctx.refinement ? `User refinement instruction (any language):\n${ctx.refinement}` : '',
+  ].filter(Boolean).join('\n\n');
+
+  const resp = await c.chat.completions.create({
+    model: env.OPENAI_MODEL,
+    temperature: 0.1,
+    messages: [
+      { role: 'system', content: SYSTEM },
+      { role: 'system', content: REPAIR_SYSTEM },
+      { role: 'system', content: `Max rows: ${env.REPORT_MAX_ROWS}. Schema digest:\n${schemaToPrompt(digest)}` },
+      { role: 'user',   content: context },
+    ],
+    response_format: {
+      type: 'json_schema',
+      json_schema: { name: 'report', schema: SCHEMA, strict: false },
+    },
+  });
+  const content = resp.choices[0]?.message?.content;
+  if (!content) throw new Error('LLM returned empty response');
+  let parsed: unknown;
+  try { parsed = JSON.parse(content); } catch { throw new Error('LLM output was not valid JSON'); }
+  return parsed as LlmReport;
+}
