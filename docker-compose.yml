@@ -119,8 +119,13 @@ services:
           exit 0
         fi
         echo "[bootstrap-restore] mongorestore /dump/primary.archive.gz -> mongo-secondary/$$SECONDARY_DB"
+        # Use discrete flags instead of --uri so passwords containing '@', ':',
+        # '/' etc. don't need URL-encoding.
         mongorestore \
-          --uri="mongodb://$$SECONDARY_USERNAME:$$SECONDARY_PASSWORD@mongo-secondary:27017/?authSource=admin" \
+          --host=mongo-secondary:27017 \
+          --username="$$SECONDARY_USERNAME" \
+          --password="$$SECONDARY_PASSWORD" \
+          --authenticationDatabase=admin \
           --nsFrom="$$PRIMARY_DB.*" \
           --nsTo="$$SECONDARY_DB.*" \
           --drop \
@@ -184,7 +189,7 @@ services:
           ts=$$(date -u +%Y%m%d_%H%M%SZ)
           file="/backups/secondary_$$ts.archive.gz"
           echo "[backup] $$(date -u +%FT%TZ) start -> $$file"
-          if mongodump --uri="mongodb://$$MONGO_USER:$$MONGO_PASS@mongo-secondary:27017/?authSource=admin" --gzip --archive=$$file; then
+          if mongodump --host=mongo-secondary:27017 --username="$$MONGO_USER" --password="$$MONGO_PASS" --authenticationDatabase=admin --gzip --archive=$$file; then
             sz=$$(du -h $$file | cut -f1)
             echo "[backup] ok ($$sz)"
             ls -1t /backups/secondary_*.archive.gz 2>/dev/null | tail -n +$$((RETENTION+1)) | xargs -r rm -f
