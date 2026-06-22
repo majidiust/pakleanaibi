@@ -38,6 +38,39 @@ function downloadBlob(blob: Blob, filename: string): void {
   setTimeout(() => URL.revokeObjectURL(url), 4000);
 }
 
+// --- Persian / Arabic support ---------------------------------------------
+// jsPDF's default fonts cover Latin-1 only and the PDF text engine renders
+// strictly LTR with no shaping. To make Farsi (and Arabic) legible in the
+// exported PDF we (1) embed a font that ships Arabic glyphs, (2) convert
+// each RTL string to its joined presentation forms using PersianShaper,
+// and (3) reverse the result so the visual order matches RTL when drawn
+// LTR. Latin segments inside a cell are not bidi-corrected — mixed-script
+// cells will show the Latin run reversed; for typical BI data (cells are
+// monolingual) the simple reversal is the standard pragmatic approach.
+
+const RTL_RE = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/;
+export function containsRTL(s: string): boolean { return RTL_RE.test(s); }
+
+let fontPromise: Promise<string | null> | null = null;
+function loadVazirmatn(): Promise<string | null> {
+  if (fontPromise) return fontPromise;
+  fontPromise = (async () => {
+    try {
+      const res = await fetch('/fonts/Vazirmatn-Regular.ttf');
+      if (!res.ok) return null;
+      const buf = new Uint8Array(await res.arrayBuffer());
+      // Chunked btoa to avoid blowing the call stack on the spread operator.
+      let bin = '';
+      const CHUNK = 0x8000;
+      for (let i = 0; i < buf.length; i += CHUNK) {
+        bin += String.fromCharCode.apply(null, Array.from(buf.subarray(i, i + CHUNK)));
+      }
+      return btoa(bin);
+    } catch { return null; }
+  })();
+  return fontPromise;
+}
+
 export async function exportXlsx(
   rows: Record<string, unknown>[],
   filename: string,
@@ -59,7 +92,10 @@ export async function exportXlsx(
     type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF5457E0' },
   };
   ws.getRow(1).alignment = { vertical: 'middle' };
-  ws.views = [{ state: 'frozen', ySplit: 1 }];
+  ws.views = [{ state: 'frozen', ySplit: 1, rightToLeft: columns.some(containsRTL) }];
+  // Track which columns contain RTL values so we can right-align them; Excel
+  // handles the shaping/bidi natively, we just need the column alignment.
+  const rtlCols = new Set<string>();
   for (const r of rows) {
     const out: Record<string, unknown> = {};
     for (const k of columns) {
@@ -67,8 +103,13 @@ export async function exportXlsx(
       if (v instanceof Date) out[k] = v;
       else if (v && typeof v === 'object') out[k] = flatten(v);
       else out[k] = v ?? '';
+      if (typeof out[k] === 'string' && containsRTL(out[k] as string)) rtlCols.add(k);
     }
     ws.addRow(out);
+  }
+  for (const k of rtlCols) {
+    const col = ws.getColumn(k);
+    if (col) col.alignment = { horizontal: 'right', vertical: 'middle', readingOrder: 'rtl' };
   }
   // Auto-filter so users can sort/filter in Excel without extra setup.
   ws.autoFilter = {
@@ -86,16 +127,41 @@ export async function exportPdf(
   filename: string,
   title = 'Report',
 ): Promise<void> {
-  const { jsPDF } = await import('jspdf');
-  const autoTable = (await import('jspdf-autotable')).default;
+  const [{ jsPDF }, autoTableMod, fontB64, reshaperMod] = await Promise.all([
+    import('jspdf'),
+    import('jspdf-autotable'),
+    loadVazirmatn(),
+    import('arabic-persian-reshaper'),
+  ]);
+  const autoTable = autoTableMod.default;
+  const shape = reshaperMod.PersianShaper.convertArabic.bind(reshaperMod.PersianShaper);
+  // Reshape + reverse so RTL text reads correctly when drawn LTR by the
+  // PDF text engine. No-op for cells without Arabic/Persian codepoints.
+  const rtl = (s: string): string => containsRTL(s)
+    ? [...shape(s)].reverse().join('') : s;
+
   const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
+
+  // Register Vazirmatn so the PDF actually contains the glyphs for Persian
+  // codepoints. Fall back silently to Helvetica if the font file is
+  // unreachable (offline build, blocked CDN) — at least the export still
+  // succeeds with Latin text rendered correctly.
+  const FONT = 'Vazirmatn';
+  let fontReady = false;
+  if (fontB64) {
+    doc.addFileToVFS('Vazirmatn-Regular.ttf', fontB64);
+    doc.addFont('Vazirmatn-Regular.ttf', FONT, 'normal');
+    doc.setFont(FONT, 'normal');
+    fontReady = true;
+  }
+
   const columns = pickColumns(rows);
   const body = rows.map(r => columns.map(k => flatten(r[k])));
 
   // Title strip
   doc.setFontSize(14);
   doc.setTextColor(20, 20, 24);
-  doc.text(title, 40, 32);
+  doc.text(rtl(title), 40, 32);
   doc.setFontSize(9);
   doc.setTextColor(110, 110, 122);
   doc.text(
@@ -103,19 +169,43 @@ export async function exportPdf(
     40, 48,
   );
 
+  // Pre-shape headers and body so the table renders correctly. Keep track
+  // of which body cells are RTL so we can right-align them in didParseCell
+  // without re-scanning the (already reshaped) text.
+  const headRow = columns.map(rtl);
+  const rtlMask = body.map(row => row.map(containsRTL));
+  const shapedBody = body.map((row, i) => row.map((c, j) => rtlMask[i][j] ? rtl(c) : c));
+  const rtlHeader = columns.map(containsRTL);
+
   autoTable(doc, {
     startY: 60,
-    head: [columns],
-    body,
-    styles: { fontSize: 8, cellPadding: 4, overflow: 'linebreak', valign: 'top' },
-    headStyles: { fillColor: [84, 87, 224], textColor: 255, fontStyle: 'bold' },
+    head: [headRow],
+    body: shapedBody,
+    styles: {
+      fontSize: 8, cellPadding: 4, overflow: 'linebreak', valign: 'top',
+      ...(fontReady ? { font: FONT, fontStyle: 'normal' } : {}),
+    },
+    headStyles: {
+      fillColor: [84, 87, 224], textColor: 255,
+      ...(fontReady ? { font: FONT, fontStyle: 'normal' } : { fontStyle: 'bold' }),
+    },
     alternateRowStyles: { fillColor: [248, 248, 251] },
     margin: { top: 60, left: 28, right: 28, bottom: 32 },
+    didParseCell: (data) => {
+      // Right-align cells whose original text is RTL so columns of Persian
+      // values read naturally from the right edge.
+      const isHead = data.section === 'head';
+      const isRtl = isHead
+        ? !!rtlHeader[data.column.index]
+        : !!rtlMask[data.row.index]?.[data.column.index];
+      if (isRtl) data.cell.styles.halign = 'right';
+    },
     didDrawPage: (data) => {
       // Page footer with page number.
       const pageNo = doc.getNumberOfPages();
       doc.setFontSize(8);
       doc.setTextColor(140);
+      if (fontReady) doc.setFont(FONT, 'normal');
       doc.text(
         `Page ${data.pageNumber} of ${pageNo}`,
         doc.internal.pageSize.getWidth() - 80, doc.internal.pageSize.getHeight() - 16,
