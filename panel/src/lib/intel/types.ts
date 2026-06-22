@@ -187,3 +187,98 @@ export interface IntelAudit {
   target?: string;
   details?: Record<string, unknown>;
 }
+
+// -----------------------------------------------------------------------
+// Saved Reports / Report Templates
+// -----------------------------------------------------------------------
+
+export type TemplateVisibility = 'private' | 'shared' | 'public';
+export type TemplateDisplayKind = 'table' | 'bar' | 'line' | 'pie' | 'area';
+
+export interface TemplateParameter {
+  /** Placeholder key referenced in the pipeline as {{key}} or {$param:"key"}. */
+  key: string;
+  /** Human label shown in the run-parameters form. */
+  label: string;
+  /** Coercion applied before substitution. */
+  type: 'string' | 'number' | 'date' | 'boolean' | 'objectId';
+  /** Default value used when the user does not override it. */
+  defaultValue?: string | number | boolean | null;
+  /** Optional list of suggested values (rendered as a dropdown when present). */
+  options?: (string | number)[];
+  required?: boolean;
+  description?: string;
+}
+
+export interface TemplateDisplay {
+  kind: TemplateDisplayKind;
+  xField?: string;
+  yField?: string;
+  seriesField?: string;
+  title?: string;
+}
+
+/** A snapshot of the relationships the pipeline relied on at save time. */
+export interface TemplateRelationshipRef {
+  fingerprint: string;
+  source: { collection: string; field: string };
+  target: { collection: string; field: string; matchOn?: string };
+  type: string;
+}
+
+export interface IntelReportTemplate {
+  _id?: ObjectId;
+  title: string;
+  description?: string;
+  /** Free-form grouping ("Finance", "Sales", ...). */
+  category?: string;
+  tags: string[];
+  visibility: TemplateVisibility;
+  /** Logical connection key; today there is exactly one read-only data DB. */
+  connection?: string;
+  /** Anchor collection the pipeline runs against. */
+  collection: string;
+  /** Aggregation pipeline; may contain {{param}} placeholders. */
+  pipeline: Record<string, unknown>[];
+  /** Original natural-language prompt that produced this template. */
+  sourcePrompt?: string;
+  /** Distinct collections referenced by the pipeline (anchor + $lookup.from). */
+  usedCollections: string[];
+  /** Relationships the pipeline depends on, captured at save time. */
+  usedRelationships: TemplateRelationshipRef[];
+  /** Output column hints surfaced in the result UI. */
+  outputFields?: string[];
+  /** Run-time parameter slots. */
+  parameters: TemplateParameter[];
+  /** Default sort spec applied client-side when present. */
+  defaultSort?: { field: string; direction: 1 | -1 };
+  display: TemplateDisplay;
+  /** Bumped each time the template body is edited. */
+  version: number;
+  createdAt: Date;
+  createdBy: string;
+  updatedAt: Date;
+  updatedBy?: string;
+  lastRunAt?: Date;
+  lastRunStatus?: 'ok' | 'failed';
+  lastRunError?: string;
+  lastRunTookMs?: number;
+  lastRunRowCount?: number;
+  runCount: number;
+}
+
+export interface IntelReportTemplateVersion {
+  _id?: ObjectId;
+  templateId: ObjectId;
+  version: number;
+  takenAt: Date;
+  takenBy: string;
+  /** Frozen snapshot of the template body (everything that drives the query). */
+  snapshot: Pick<IntelReportTemplate,
+    'title' | 'description' | 'category' | 'tags' | 'visibility' |
+    'collection' | 'pipeline' | 'parameters' | 'display' |
+    'usedCollections' | 'usedRelationships' | 'outputFields' |
+    'defaultSort' | 'sourcePrompt'
+  >;
+  note?: string;
+}

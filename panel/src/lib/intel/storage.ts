@@ -5,6 +5,7 @@ import { biDb } from '../mongo';
 import type {
   IntelCollection, IntelRelationship, IntelJob, IntelVersion,
   IntelLearning, IntelAudit,
+  IntelReportTemplate, IntelReportTemplateVersion,
 } from './types';
 
 const C = {
@@ -14,6 +15,8 @@ const C = {
   versions: 'intel_versions',
   learning: 'intel_learning',
   audit: 'intel_audit',
+  templates: 'report_templates',
+  templateVersions: 'report_template_versions',
 } as const;
 
 declare global {
@@ -35,6 +38,12 @@ async function ensureIndexes() {
     db.collection(C.versions).createIndex({ version: -1 }),
     db.collection(C.learning).createIndex({ pattern: 1 }, { unique: true }),
     db.collection(C.audit).createIndex({ ts: -1 }),
+    db.collection(C.templates).createIndex({ createdBy: 1, updatedAt: -1 }),
+    db.collection(C.templates).createIndex({ visibility: 1, updatedAt: -1 }),
+    db.collection(C.templates).createIndex({ category: 1 }),
+    db.collection(C.templates).createIndex({ tags: 1 }),
+    db.collection(C.templates).createIndex({ title: 1 }),
+    db.collection(C.templateVersions).createIndex({ templateId: 1, version: -1 }),
   ]);
   global.__paklean_intel_indexes_done = true;
 }
@@ -56,6 +65,12 @@ export async function intelLearning(): Promise<Collection<IntelLearning>> {
 }
 export async function intelAudit(): Promise<Collection<IntelAudit>> {
   await ensureIndexes(); return (await biDb()).collection<IntelAudit>(C.audit);
+}
+export async function reportTemplates(): Promise<Collection<IntelReportTemplate>> {
+  await ensureIndexes(); return (await biDb()).collection<IntelReportTemplate>(C.templates);
+}
+export async function reportTemplateVersions(): Promise<Collection<IntelReportTemplateVersion>> {
+  await ensureIndexes(); return (await biDb()).collection<IntelReportTemplateVersion>(C.templateVersions);
 }
 
 export async function audit(actor: string, action: string, target?: string, details?: Record<string, unknown>) {

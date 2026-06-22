@@ -29,6 +29,12 @@ const Icon = {
       <path d="M15.5 4.5l1 2 2 1-2 1-1 2-1-2-2-1 2-1z" />
     </svg>
   ),
+  Saved: (p: IconProps) => (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" {...p}>
+      <path d="M5 3h10a1 1 0 0 1 1 1v13l-6-3.5L4 17V4a1 1 0 0 1 1-1z" />
+      <path d="M7.5 8h5M7.5 10.5h3.5" />
+    </svg>
+  ),
   Intelligence: (p: IconProps) => (
     <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" {...p}>
       <circle cx="5" cy="5" r="2.2" /><circle cx="15" cy="5" r="2.2" />
@@ -49,12 +55,13 @@ const Icon = {
 };
 
 const ITEMS = [
-  { href: '/dashboard',    label: 'Dashboard',    Icon: Icon.Dashboard },
-  { href: '/reports',      label: 'Reports',      Icon: Icon.Reports },
-  { href: '/agentic',      label: 'Agentic Report', Icon: Icon.Agentic },
-  { href: '/intelligence', label: 'Intelligence', Icon: Icon.Intelligence },
-  { href: '/users',        label: 'Users',        Icon: Icon.Users },
-  { href: '/account',      label: 'Account',      Icon: Icon.Account },
+  { href: '/dashboard',         label: 'Dashboard',      Icon: Icon.Dashboard },
+  { href: '/reports',           label: 'Reports',        Icon: Icon.Reports },
+  { href: '/agentic',           label: 'Agentic Report', Icon: Icon.Agentic },
+  { href: '/reports/templates', label: 'Saved Reports',  Icon: Icon.Saved },
+  { href: '/intelligence',      label: 'Intelligence',   Icon: Icon.Intelligence },
+  { href: '/users',             label: 'Users',          Icon: Icon.Users },
+  { href: '/account',           label: 'Account',        Icon: Icon.Account },
 ];
 
 function Avatar({ name }: { name: string }) {
@@ -70,6 +77,10 @@ function Avatar({ name }: { name: string }) {
 export function Sidebar({ user }: { user: { name: string; email: string; role: string } }) {
   const path = usePathname();
   const router = useRouter();
+  // Longest-prefix match of the current pathname against the nav items. This
+  // prevents /reports/templates from also highlighting /reports.
+  const activeHref = ITEMS.reduce((best, it) =>
+    (path === it.href || path.startsWith(it.href + '/')) && it.href.length > best.length ? it.href : best, '');
 
   async function logout() {
     await fetch('/api/auth/logout', { method: 'POST' });
@@ -96,7 +107,9 @@ export function Sidebar({ user }: { user: { name: string; email: string; role: s
       <nav className="flex-1 px-2 py-3 space-y-0.5">
         <div className="label px-3 pb-1 pt-1">Workspace</div>
         {ITEMS.map(({ href, label, Icon: I }) => {
-          const active = path === href || path.startsWith(href + '/');
+          // Resolve the single active route as the longest prefix match so
+          // /reports/templates doesn't also highlight /reports.
+          const active = href === activeHref;
           return (
             <Link key={href} href={href}
               className={clsx(

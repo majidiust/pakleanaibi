@@ -2,6 +2,7 @@
 import { useCallback, useRef, useState, useEffect } from 'react';
 import { DataTable } from '@/components/DataTable';
 import { ChartView, type ChartDisplay } from '@/components/ChartView';
+import { SaveTemplateModal } from './SaveTemplateModal';
 
 interface LlmReport {
   collection: string;
@@ -34,7 +35,12 @@ export function AgenticClient() {
   const [err, setErr] = useState<string | null>(null);
   const [report, setReport] = useState<LlmReport | null>(null);
   const [execution, setExecution] = useState<Execution | null>(null);
+  const [savingTemplate, setSavingTemplate] = useState(false);
+  const [savedNotice, setSavedNotice] = useState<string | null>(null);
   const chatRef = useRef<HTMLDivElement>(null);
+  // Last user-authored prompt; used as the template's `sourcePrompt` so we
+  // can show analysts what natural-language ask produced this saved report.
+  const lastUserPrompt = [...history].reverse().find(m => m.role === 'user')?.content;
 
   useEffect(() => {
     if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
@@ -119,9 +125,20 @@ export function AgenticClient() {
       </div>
 
       {err && <div className="card card-pad text-err text-sm whitespace-pre-wrap">{err}</div>}
+      {savedNotice && (
+        <div className="card card-pad text-sm flex items-center justify-between gap-3">
+          <span className="text-ok">✓ {savedNotice}</span>
+          <button className="btn-subtle btn-sm" onClick={() => setSavedNotice(null)} aria-label="Dismiss">✕</button>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-[1.4fr_1fr] gap-4 items-start">
-        <ResultPanel report={report} execution={execution} busy={busy} onExecute={executeReport} />
+        <ResultPanel
+          report={report} execution={execution} busy={busy}
+          onExecute={executeReport}
+          onSaveAsTemplate={() => setSavingTemplate(true)}
+          canSave={report !== null && (execution?.ok ?? false)}
+        />
         <ChatPanel
           history={history} input={input} busy={busy} chatRef={chatRef}
           onInput={setInput} onSend={() => sendTurn(input)}
@@ -129,13 +146,27 @@ export function AgenticClient() {
           showExamples={history.length === 0}
         />
       </div>
+
+      {savingTemplate && report && (
+        <SaveTemplateModal
+          report={report}
+          sourcePrompt={lastUserPrompt}
+          onClose={() => setSavingTemplate(false)}
+          onSaved={() => {
+            setSavingTemplate(false);
+            setSavedNotice('Saved to Saved Reports. Find it in the sidebar to run it again with different parameters.');
+          }}
+        />
+      )}
     </div>
   );
 }
 
-function ResultPanel({ report, execution, busy, onExecute }: {
+function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, canSave }: {
   report: LlmReport | null; execution: Execution | null;
   busy: 'turn' | 'exec' | null; onExecute: () => void;
+  onSaveAsTemplate: () => void;
+  canSave: boolean;
 }) {
   if (!report) {
     return (
@@ -167,9 +198,18 @@ function ResultPanel({ report, execution, busy, onExecute }: {
             )}
             {execution && !execution.ok && <span className="pill-err">execution failed</span>}
           </div>
-          <button className="btn-primary btn-sm" disabled={busy !== null} onClick={onExecute}>
-            {busy === 'exec' ? 'Running…' : '▶ Execute'}
-          </button>
+          <div className="flex items-center gap-1.5">
+            <button
+              className="btn-ghost btn-sm"
+              disabled={!canSave || busy !== null}
+              onClick={onSaveAsTemplate}
+              title={canSave ? 'Save this pipeline as a reusable report template' : 'Execute the query successfully before saving'}>
+              ☆ Save as template
+            </button>
+            <button className="btn-primary btn-sm" disabled={busy !== null} onClick={onExecute}>
+              {busy === 'exec' ? 'Running…' : '▶ Execute'}
+            </button>
+          </div>
         </div>
         <p dir="auto" className="text-sm text-ink-2 whitespace-pre-wrap leading-relaxed">{report.explanation}</p>
         {report.warnings && report.warnings.length > 0 && (
