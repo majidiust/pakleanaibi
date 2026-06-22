@@ -162,6 +162,25 @@ function enrichError(raw: string, broken: LlmReport): string {
       'A date comparison failed because the right-hand side was a string and the left-hand side is a BSON Date (or vice versa). Always emit dates as EJSON {"$date": "<ISO with Z>"} so the driver serialises a real BSON Date.',
     );
   }
+  // Malformed expression shape — the model serialised an operator and its
+  // arguments into the KEY of an object (e.g. `"$eq:["` ... or a duplicate
+  // `$eq` key inside an `$and`). MongoDB reports this as "must have exactly
+  // one field" / "Unrecognized expression"; the pipeline-guard now catches
+  // most cases earlier with "Malformed operator key" but we want the same
+  // explicit hint either way so the repair turn rebuilds the expression
+  // tree from scratch rather than micro-editing the broken keys.
+  if (
+    lower.includes('must have exactly one field') ||
+    lower.includes('unrecognized expression') ||
+    lower.includes('malformed operator key')
+  ) {
+    hints.push(
+      'The previous pipeline had a malformed expression: operator name and arguments were merged into a single object key (e.g. {"$eq:[": ...}) or `&and` was emitted instead of `$and`.',
+      'JSON SHAPE RULE: every operator is a CLEAN top-level key whose VALUE is the argument list, never inside the key. Multiple conditions go inside $and / $or arrays as separate sibling objects.',
+      'Correct shape for a multi-condition $match: { "$match": { "$expr": { "$and": [ { "$gte": ["$date", {"$date":"2026-01-01T00:00:00Z"}] }, { "$eq": ["$isDeleted", false] }, { "$eq": ["$messageState", "done"] } ] } } }',
+      'If the filter does NOT need to reference another field with `$`-prefixed paths, prefer the plain {"$match": { "isDeleted": false, "messageState": "done", "dCreateDate": { "$gte": …, "$lt": … } }} form — no `$expr` / `$and` needed, and the BSON Date comparison works directly on the indexed field.',
+    );
+  }
   if (hints.length === 0) return raw;
   return `${raw}\n\nAGENT HINTS:\n- ${hints.join('\n- ')}`;
 }

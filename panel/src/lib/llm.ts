@@ -501,6 +501,35 @@ NAME RESOLUTION (resolve human-readable names to ids BEFORE filtering FKs):
   fix is almost always to insert a NAME->ID $lookup and move the filter
   to the resolved name field.
 
+JSON SHAPE RULES (read carefully — these prevent the most common
+auto-repair failures):
+- Every MongoDB operator is a CLEAN object key starting with "$" followed
+  by letters only ($and, $eq, $gte, $sum, ...). Its arguments live in the
+  VALUE, never inside the key. Never produce keys like "$eq:[", "$and:",
+  "$gte(", "$eq: [\\"$field\\", v]" — those break Mongo's parser.
+- Never use "&" in place of "$". Operators always start with "$".
+- An object can only have ONE key per operator. To combine multiple
+  conditions, use $and / $or with an ARRAY of sibling objects, each of
+  which contains exactly one operator:
+    CORRECT: { "$expr": { "$and": [
+      { "$gte": ["$dCreateDate", {"$date":"2026-06-01T00:00:00Z"}] },
+      { "$eq":  ["$isDeleted", false] },
+      { "$eq":  ["$messageState", "done"] }
+    ] } }
+    WRONG  : { "$expr": { "$and": [ { "$eq":[":false, "$eq":[":"done" ] } }
+    WRONG  : { "$expr": { "&and": [...] } }
+    WRONG  : { "$and": { "$eq": [...], "$eq": [...] } }   (duplicate key)
+- If all conditions filter ordinary indexed fields (no cross-field
+  references with $-paths), prefer the simpler $match form WITHOUT
+  $expr/$and — operators sit inside the field object:
+    { "$match": { "isDeleted": false, "messageState": "done",
+                  "dCreateDate": { "$gte": {"$date":"2026-06-01T00:00:00Z"},
+                                   "$lt":  {"$date":"2026-07-01T00:00:00Z"} } } }
+  This is faster (uses indexes) and structurally harder to mis-emit.
+- Boolean and string filter values are plain JSON literals (false, true,
+  "done") — never wrap them in $literal unless you need to disambiguate a
+  string that itself starts with "$".
+
 Self-repair mode:
 - The system message may contain a "Pending execution error" block. That
   is a MongoDB runtime error from the previous report you produced. Your
@@ -513,6 +542,10 @@ Self-repair mode:
     * Wrong/non-existent field → pick the closest field from the schema.
     * "must be an accumulator object" → use $sum/$avg/$first/$last/$min/
       $max/$push/$addToSet inside $group; no leading whitespace on $ops.
+    * "Malformed operator key" / "must have exactly one field" /
+      "Unrecognized expression '$eq:['" → re-read the JSON SHAPE RULES
+      above and REBUILD the affected expression tree from scratch. Do
+      not just tweak the broken keys.
     * Type mismatch → wrap with $toDate, $toInt, $toString, etc.
     * $lookup join key mismatch → align ObjectId vs string types.
     * Date math → pick operators allowed by the target server version

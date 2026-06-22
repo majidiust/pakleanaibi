@@ -32,20 +32,44 @@ export interface ValidatedPipeline {
 }
 
 // Recursively normalize object keys: trim surrounding whitespace, fold any
-// internal whitespace before a `$` so `" $first"` / `"$ first"` / `"$first "`
-// all become `"$first"`. LLMs occasionally insert leading spaces before
-// accumulator operators (which MongoDB then rejects with "must be an
-// accumulator object").
+// internal whitespace after a `$` so `" $first"` / `"$ first"` / `"$first "`
+// all become `"$first"`, and rewrite `&` -> `$` at the start of operator
+// keys (LLMs occasionally emit `"&and"` / `"&eq"` instead of `"$and"`).
+// Any operator-shaped key with illegal characters in the body (`":"`, `"["`,
+// `"("`, `","`) is left alone here so the downstream validator can throw a
+// useful error pointing at the original key.
+const OP_BODY = /^[A-Za-z][A-Za-z0-9_]*$/;
 function sanitizeKeys(node: unknown): unknown {
   if (node === null || typeof node !== 'object') return node;
   if (Array.isArray(node)) return node.map(sanitizeKeys);
   const out: Record<string, unknown> = {};
   for (const [rawK, v] of Object.entries(node as Record<string, unknown>)) {
     let k = rawK.trim();
+    if (k.startsWith('&') && OP_BODY.test(k.slice(1))) k = '$' + k.slice(1);
     if (k.startsWith('$')) k = '$' + k.slice(1).replace(/\s+/g, '');
     out[k] = sanitizeKeys(v);
   }
   return out;
+}
+
+// Walk every object key. Operator-shaped keys (start with `$`) must have a
+// clean identifier body; anything else (`$eq:[`, `$gte(`, `$and,`) means the
+// model serialised an entire expression as a key — MongoDB will reject this
+// with confusing duplicate-field errors. Throwing here gives the repair loop
+// a clear, actionable message instead.
+function assertOperatorKeysWellFormed(node: unknown, path: string): void {
+  if (node === null || typeof node !== 'object') return;
+  if (Array.isArray(node)) { node.forEach((c, i) => assertOperatorKeysWellFormed(c, `${path}[${i}]`)); return; }
+  for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+    if (k.startsWith('$') && !OP_BODY.test(k.slice(1))) {
+      throw new Error(
+        `Malformed operator key "${k}" at ${path}. Each operator must be a ` +
+        `clean key with its value as an object/array, e.g. {"$eq": ["$field", "value"]}. ` +
+        `Never put the operator's arguments inside the key itself.`,
+      );
+    }
+    assertOperatorKeysWellFormed(v, `${path}.${k}`);
+  }
 }
 
 function deepCheck(node: unknown, path: string): void {
@@ -73,9 +97,13 @@ export function validatePipeline(input: {
   if (input.pipeline.length === 0) throw new Error('pipeline must not be empty');
   if (input.pipeline.length > 24) throw new Error('pipeline too long');
 
-  // Sanitize keys (trim whitespace, fold internal whitespace after $) BEFORE
-  // any other check — see comment on sanitizeKeys above.
+  // Sanitize keys (trim whitespace, fold internal whitespace after $, rewrite
+  // `&op` -> `$op`) BEFORE any other check. Then assert that every operator
+  // key has a clean identifier body so malformed shapes like `"$eq:["` are
+  // caught here with an actionable error instead of bubbling up as a
+  // confusing duplicate-field error from MongoDB at execution time.
   const normalized = sanitizeKeys(input.pipeline) as unknown[];
+  assertOperatorKeysWellFormed(normalized, 'pipeline');
 
   const out: Record<string, unknown>[] = [];
   for (let i = 0; i < normalized.length; i++) {
