@@ -11,13 +11,7 @@ import {
   type SortingState,
 } from '@tanstack/react-table';
 import { ExportModal } from './ExportModal';
-
-function fmtCell(v: unknown): string {
-  if (v === null || v === undefined) return '';
-  if (v instanceof Date) return v.toISOString();
-  if (typeof v === 'object') return JSON.stringify(v);
-  return String(v);
-}
+import { CellValue } from './CellValue';
 
 export function DataTable({ rows, title }: { rows: Record<string, unknown>[]; title?: string }) {
   const [sorting, setSorting] = useState<SortingState>([]);
@@ -30,7 +24,7 @@ export function DataTable({ rows, title }: { rows: Record<string, unknown>[]; ti
     return [...keys].map(k => ({
       accessorKey: k,
       header: k,
-      cell: info => <span className="font-mono text-xs">{fmtCell(info.getValue())}</span>,
+      cell: info => <CellValue v={info.getValue()} />,
       sortingFn: 'auto',
     }));
   }, [rows]);
