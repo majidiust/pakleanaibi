@@ -368,6 +368,18 @@ Constraints on report output (when kind="report"):
 - Pick a display.kind that matches the shape ("bar" / "line" / "pie" /
   "area" / "table") with appropriate xField / yField.
 
+USER-ATTACHED FIELD HINTS:
+- A user message may end with a block of the form:
+    [Attached fields]
+    - <collection>.<path> (<type>)
+    - …
+- These are explicit hints from the analyst about which schema fields
+  should drive the query. Treat them as authoritative for field
+  selection: prefer them over any other plausible field with a similar
+  name, and verify they appear in the schema digest before using them.
+- The block itself is metadata, not a question. Do NOT echo it back in
+  "message" and do NOT ask the user to confirm it.
+
 PIPELINE PLANNING (read carefully — this prevents timeouts):
 - Identify the ANCHOR collection: the one whose filter is most selective
   (e.g. "the last order this month" = 1 row out of orders). The anchor

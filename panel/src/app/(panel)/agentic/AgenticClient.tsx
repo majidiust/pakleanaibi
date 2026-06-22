@@ -3,6 +3,7 @@ import { useCallback, useRef, useState, useEffect } from 'react';
 import { DataTable } from '@/components/DataTable';
 import { ChartView, type ChartDisplay } from '@/components/ChartView';
 import { SaveTemplateModal } from './SaveTemplateModal';
+import { FieldAttacher, type AttachedField } from './FieldAttacher';
 
 interface LlmReport {
   collection: string;
@@ -37,6 +38,7 @@ export function AgenticClient() {
   const [execution, setExecution] = useState<Execution | null>(null);
   const [savingTemplate, setSavingTemplate] = useState(false);
   const [savedNotice, setSavedNotice] = useState<string | null>(null);
+  const [attached, setAttached] = useState<AttachedField[]>([]);
   const chatRef = useRef<HTMLDivElement>(null);
   // Last user-authored prompt; used as the template's `sourcePrompt` so we
   // can show analysts what natural-language ask produced this saved report.
@@ -50,9 +52,19 @@ export function AgenticClient() {
     const trimmed = text.trim();
     if (!trimmed || busy) return;
     setErr(null);
-    const nextHist: ChatMsg[] = [...history, { role: 'user', content: trimmed }];
+    // If the analyst attached schema fields via the "+ Field" picker,
+    // append them as an explicit hint block. The LLM already sees the
+    // full schema digest, but having the user signal exactly which
+    // fields drive the question dramatically reduces the chance of
+    // picking the wrong column when several have similar names.
+    const attachedBlock = attached.length > 0
+      ? '\n\n[Attached fields]\n' + attached.map(a => `- ${a.collection}.${a.path} (${a.type})`).join('\n')
+      : '';
+    const userContent = trimmed + attachedBlock;
+    const nextHist: ChatMsg[] = [...history, { role: 'user', content: userContent }];
     setHistory(nextHist);
     setInput('');
+    setAttached([]);
     setBusy('turn');
     try {
       // Send only the recent slice of the conversation. The server applies
@@ -105,7 +117,7 @@ export function AgenticClient() {
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'request failed');
     } finally { setBusy(null); }
-  }, [history, report, busy]);
+  }, [history, report, busy, attached]);
 
   const executeReport = useCallback(async () => {
     if (!report || busy) return;
@@ -131,7 +143,7 @@ export function AgenticClient() {
 
   function resetSession() {
     if (!confirm('Start a new conversation? Current report and chat will be cleared.')) return;
-    setHistory([]); setReport(null); setExecution(null); setErr(null); setInput('');
+    setHistory([]); setReport(null); setExecution(null); setErr(null); setInput(''); setAttached([]);
   }
 
   return (
@@ -166,6 +178,7 @@ export function AgenticClient() {
           onInput={setInput} onSend={() => sendTurn(input)}
           onExample={(s) => { setInput(s); }}
           showExamples={history.length === 0}
+          attached={attached} onAttachedChange={setAttached}
         />
       </div>
 
@@ -275,11 +288,12 @@ function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, can
   );
 }
 
-function ChatPanel({ history, input, busy, chatRef, onInput, onSend, onExample, showExamples }: {
+function ChatPanel({ history, input, busy, chatRef, onInput, onSend, onExample, showExamples, attached, onAttachedChange }: {
   history: ChatMsg[]; input: string; busy: 'turn' | 'exec' | null;
   chatRef: React.RefObject<HTMLDivElement>;
   onInput: (v: string) => void; onSend: () => void;
   onExample: (s: string) => void; showExamples: boolean;
+  attached: AttachedField[]; onAttachedChange: (next: AttachedField[]) => void;
 }) {
   return (
     <div className="card flex flex-col h-[min(720px,calc(100vh-180px))] sticky top-4">
@@ -328,6 +342,19 @@ function ChatPanel({ history, input, busy, chatRef, onInput, onSend, onExample, 
         )}
       </div>
       <div className="border-t border-line p-3 space-y-2">
+        {attached.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {attached.map((a, i) => (
+              <span key={`${a.collection}.${a.path}.${i}`} className="pill-accent gap-1.5">
+                <span className="font-mono">{a.collection}.{a.path}</span>
+                <span className="text-muted">{a.type}</span>
+                <button type="button" className="text-muted hover:text-ink"
+                  onClick={() => onAttachedChange(attached.filter((_, j) => j !== i))}
+                  aria-label={`Remove ${a.collection}.${a.path}`}>✕</button>
+              </span>
+            ))}
+          </div>
+        )}
         <textarea
           className="input min-h-[64px] text-[14px]"
           dir="auto"
@@ -339,7 +366,10 @@ function ChatPanel({ history, input, busy, chatRef, onInput, onSend, onExample, 
           }}
         />
         <div className="flex items-center justify-between gap-2">
-          <span className="text-2xs text-muted">⌘/Ctrl + Enter to send</span>
+          <div className="flex items-center gap-2">
+            <FieldAttacher attached={attached} onChange={onAttachedChange} disabled={busy !== null} />
+            <span className="text-2xs text-muted hidden sm:inline">⌘/Ctrl + Enter to send</span>
+          </div>
           <button className="btn-primary btn-sm" disabled={!input.trim() || busy !== null} onClick={onSend}>
             {busy === 'turn' ? 'Sending…' : 'Send'}
           </button>
