@@ -34,8 +34,23 @@ export interface CacheHit {
 
 const COLL = 'report_cache';
 
+// Map of common look-alike characters used across Persian / Arabic so that
+// "علی" (Persian yeh) and "علي" (Arabic yeh) hash to the same cache key.
+const NORMALIZE_MAP: Record<string, string> = {
+  '\u064A': '\u06CC', // ARABIC YEH -> PERSIAN YEH
+  '\u0649': '\u06CC', // ALEF MAKSURA -> PERSIAN YEH
+  '\u0643': '\u06A9', // ARABIC KAF -> PERSIAN KAF
+  '\u200C': ' ',      // ZWNJ -> space
+  '\u200B': '',       // ZWSP -> remove
+  '\u200E': '', '\u200F': '', // LRM / RLM -> remove
+};
+
 export function normalizeQuestion(q: string): string {
-  return q.toLowerCase().replace(/\s+/g, ' ').replace(/[?!.]+$/g, '').trim();
+  let s = q.normalize('NFC').toLowerCase();
+  s = s.replace(/[\u064A\u0649\u0643\u200C\u200B\u200E\u200F]/g, ch => NORMALIZE_MAP[ch] ?? ch);
+  // Strip Arabic/Persian and Latin sentence-final punctuation. \u061F is ؟.
+  s = s.replace(/[?!.\u061F\u06D4]+$/g, '');
+  return s.replace(/\s+/g, ' ').trim();
 }
 
 function questionKey(qNorm: string, schemaVersion: string, model: string): string {

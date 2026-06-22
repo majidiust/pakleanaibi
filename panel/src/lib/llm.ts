@@ -37,6 +37,14 @@ export interface LlmReport {
 const SYSTEM = `You are a senior BI analyst. Given a natural-language question and a MongoDB schema digest,
 produce a single read-only aggregation pipeline that answers the question.
 
+Language:
+- The question may be in any language (English, Persian/Farsi, Arabic, Turkish, ...).
+- The schema field and collection names are in English. Map terms from the user's
+  language to the closest matching English schema fields. Do NOT translate field
+  or collection names in the pipeline — use them exactly as they appear in the schema.
+- Write the "explanation" in the SAME language as the user's question. Other JSON
+  values (collection name, field names, $-operators) stay in English.
+
 Hard constraints:
 - Output JSON only, matching the provided JSON schema.
 - "pipeline" MUST be a valid MongoDB aggregation pipeline (array of stages).

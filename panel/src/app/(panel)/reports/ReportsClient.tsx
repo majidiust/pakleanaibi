@@ -1,5 +1,5 @@
 'use client';
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { DataTable } from '@/components/DataTable';
 import { ChartView, type ChartDisplay } from '@/components/ChartView';
 
@@ -21,6 +21,8 @@ const EXAMPLES = [
   'Average order value per day for the last 14 days',
 ];
 
+interface Favorite { id: string; question: string; label?: string; hits: number }
+
 export function ReportsClient() {
   const [question, setQuestion] = useState('');
   const [ask, setAsk] = useState<AskResult | null>(null);
@@ -28,6 +30,43 @@ export function ReportsClient() {
   const [busy, setBusy] = useState<'ask' | 'run' | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [skipCache, setSkipCache] = useState(false);
+  const [favorites, setFavorites] = useState<Favorite[]>([]);
+  const [savingFav, setSavingFav] = useState(false);
+
+  const loadFavorites = useCallback(async () => {
+    const r = await fetch('/api/reports/favorites');
+    if (r.ok) setFavorites((await r.json()).favorites);
+  }, []);
+  useEffect(() => { void loadFavorites(); }, [loadFavorites]);
+
+  async function saveFavorite() {
+    const q = question.trim();
+    if (!q) return;
+    setSavingFav(true);
+    try {
+      const label = prompt('Label for this prompt (optional):', '') ?? undefined;
+      const r = await fetch('/api/reports/favorites', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ question: q, label: label || undefined }),
+      });
+      if (r.ok) void loadFavorites();
+    } finally { setSavingFav(false); }
+  }
+
+  async function deleteFavorite(id: string) {
+    if (!confirm('Remove this saved prompt?')) return;
+    const r = await fetch('/api/reports/favorites/' + id, { method: 'DELETE' });
+    if (r.ok) void loadFavorites();
+  }
+
+  async function useFavorite(f: Favorite) {
+    setQuestion(f.question);
+    // Bump hit counter so the most-used prompts surface first.
+    void fetch('/api/reports/favorites/' + f.id, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ used: true }),
+    });
+  }
 
   async function onAsk() {
     setErr(null); setAsk(null); setExec(null); setBusy('ask');
@@ -60,25 +99,56 @@ export function ReportsClient() {
     <div className="space-y-5">
       <div>
         <h1 className="text-2xl font-semibold">Reports</h1>
-        <p className="text-sm text-muted">Ask a question in plain English. The model produces a read-only MongoDB pipeline and you execute it.</p>
+        <p className="text-sm text-muted">Ask a question in any language — English, Persian, etc. The model produces a read-only MongoDB pipeline.</p>
       </div>
 
       <div className="card card-pad space-y-3">
-        <textarea className="input min-h-[90px]" placeholder="e.g. Top 10 paying users this month…"
-          value={question} onChange={e => setQuestion(e.target.value)} />
-        <div className="flex flex-wrap gap-2">
-          {EXAMPLES.map(s => (
-            <button key={s} className="pill hover:bg-panel" onClick={() => setQuestion(s)}>{s}</button>
-          ))}
+        <textarea
+          className="input min-h-[90px]"
+          dir="auto"
+          placeholder="e.g. Top 10 paying users this month… / ۱۰ کاربر برتر از نظر تعداد سفارش در ۳۰ روز اخیر"
+          value={question}
+          onChange={e => setQuestion(e.target.value)}
+        />
+
+        {favorites.length > 0 && (
+          <div>
+            <div className="label mb-1">Saved prompts</div>
+            <div className="flex flex-wrap gap-2">
+              {favorites.map(f => (
+                <div key={f.id} className="pill hover:bg-panel inline-flex items-center gap-1 pr-1">
+                  <button dir="auto" className="text-left" onClick={() => useFavorite(f)} title={f.question}>
+                    {f.label || (f.question.length > 60 ? f.question.slice(0, 60) + '…' : f.question)}
+                  </button>
+                  <button className="text-muted hover:text-err px-1" onClick={() => deleteFavorite(f.id)} title="Remove">×</button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div>
+          <div className="label mb-1">Examples</div>
+          <div className="flex flex-wrap gap-2">
+            {EXAMPLES.map(s => (
+              <button key={s} className="pill hover:bg-panel" onClick={() => setQuestion(s)}>{s}</button>
+            ))}
+          </div>
         </div>
-        <div className="flex items-center justify-between gap-2">
+
+        <div className="flex items-center justify-between gap-2 flex-wrap">
           <label className="text-xs text-muted inline-flex items-center gap-2">
             <input type="checkbox" checked={skipCache} onChange={e => setSkipCache(e.target.checked)} />
             Bypass cache (force a fresh OpenAI call)
           </label>
-          <button className="btn-primary" disabled={!question.trim() || busy !== null} onClick={onAsk}>
-            {busy === 'ask' ? 'Thinking…' : 'Generate query'}
-          </button>
+          <div className="flex items-center gap-2">
+            <button className="btn-ghost text-sm" disabled={!question.trim() || savingFav} onClick={saveFavorite}>
+              {savingFav ? 'Saving…' : '★ Save prompt'}
+            </button>
+            <button className="btn-primary" disabled={!question.trim() || busy !== null} onClick={onAsk}>
+              {busy === 'ask' ? 'Thinking…' : 'Generate query'}
+            </button>
+          </div>
         </div>
       </div>
 
@@ -105,7 +175,7 @@ export function ReportsClient() {
           </div>
           <div>
             <div className="label mb-1">Plan</div>
-            <p className="text-sm text-ink whitespace-pre-wrap">{ask.explanation}</p>
+            <p dir="auto" className="text-sm text-ink whitespace-pre-wrap">{ask.explanation}</p>
           </div>
           {ask.warnings.length > 0 && (
             <div className="text-warn text-xs space-y-1">
