@@ -41,10 +41,17 @@ interface FG3DRef {
   ): { x: number; y: number; z: number };
   zoomToFit(durationMs?: number, paddingPx?: number, nodeFilter?: (n: Node) => boolean): void;
   refresh(): void;
+  // The three.js controls object (TrackballControls by default) — `.target`
+  // is the Vector3 the camera orbits around. We use it to compute zoom that
+  // tracks the current pivot instead of always pulling toward origin.
+  controls(): { target: { x: number; y: number; z: number } } | undefined;
 }
 
 interface ForceGraph3DProps {
-  ref?: MutableRefObject<FG3DRef | undefined>;
+  // next/dynamic does NOT forward the special `ref` prop (vercel/next.js#4957
+  // & #40769), so we rename it. The lib-wrapping component below feeds this
+  // through to the real ForceGraph3D ref.
+  forwardedRef?: MutableRefObject<FG3DRef | undefined>;
   graphData: { nodes: Node[]; links: Edge[] };
   width: number; height: number;
   backgroundColor: string;
@@ -67,9 +74,21 @@ interface ForceGraph3DProps {
 }
 
 // next/dynamic + react-force-graph-3d: the lib reaches for `window` at
-// import time, so it can only load in the browser.
+// import time, so it can only load in the browser. The inline wrapper here
+// re-creates ref forwarding (next/dynamic strips the `ref` prop) by reading
+// our `forwardedRef` prop and binding it to the real component's `ref`.
 const ForceGraph3D = dynamic(
-  async () => (await import('react-force-graph-3d')).default,
+  async () => {
+    const Lib = (await import('react-force-graph-3d')).default;
+    type LibProps = ForceGraph3DProps;
+    function ForceGraph3DWithRef({ forwardedRef, ...rest }: LibProps) {
+      // Casts are local to this bridge: the lib's full prop type pulls in
+      // three.js generics we don't need elsewhere in the file.
+      return <Lib ref={forwardedRef as unknown as never} {...(rest as unknown as object)} />;
+    }
+    ForceGraph3DWithRef.displayName = 'ForceGraph3DWithRef';
+    return ForceGraph3DWithRef;
+  },
   { ssr: false, loading: () => <div className="text-muted text-sm p-4">Loading 3D engine…</div> },
 ) as unknown as ComponentType<ForceGraph3DProps>;
 
@@ -190,13 +209,33 @@ export function GraphClient() {
   const linkParticles = useCallback(
     (l: Edge) => (l.status === 'manual' || l.status === 'approved') ? 2 : 0, []);
 
+  // Approximate bounding sphere of the current layout. Used to size the
+  // top/front view distances so the camera frames the graph regardless of
+  // how the simulation has spread out. Falls back to 400 before the engine
+  // has run (initial mount, before nodes get x/y/z).
+  const layoutRadius = useCallback(() => {
+    const ns = graphData.nodes;
+    let max = 0;
+    for (const n of ns) {
+      if (n.x === undefined) continue;
+      const r = Math.hypot(n.x, n.y ?? 0, n.z ?? 0);
+      if (r > max) max = r;
+    }
+    return max > 0 ? max : 400;
+  }, [graphData.nodes]);
+
   const recenter = useCallback((nodeId?: string) => {
     const fg = fgRef.current; if (!fg) return;
     if (nodeId) {
       const n = graphData.nodes.find(x => x.id === nodeId);
-      if (!n || n.x === undefined) return;
-      const dist = 120;
-      const ratio = 1 + dist / Math.max(1, Math.hypot(n.x, n.y ?? 0, n.z ?? 0));
+      if (!n || n.x === undefined) { fg.zoomToFit(700, 60); return; }
+      // Position the camera at a fixed offset behind the node along the
+      // ray from origin. Using a fixed offset (rather than scaling by node
+      // distance) means clicks on near-origin nodes don't end up with the
+      // camera intersecting the sphere.
+      const dist = 160;
+      const len = Math.max(1, Math.hypot(n.x, n.y ?? 0, n.z ?? 0));
+      const ratio = (len + dist) / len;
       fg.cameraPosition(
         { x: (n.x ?? 0) * ratio, y: (n.y ?? 0) * ratio, z: (n.z ?? 0) * ratio },
         { x: n.x ?? 0, y: n.y ?? 0, z: n.z ?? 0 },
@@ -207,13 +246,36 @@ export function GraphClient() {
     }
   }, [graphData.nodes]);
 
-  // Multiplicative camera dolly — scale the camera's distance from the
-  // current lookAt origin without changing direction.
+  // Multiplicative camera dolly along the view ray (camera -> orbit target).
+  // Reading `controls().target` keeps zoom correct after the user has panned
+  // away from the origin; the earlier implementation scaled position about
+  // (0,0,0), which produced sideways drift instead of a true zoom.
   const dolly = useCallback((factor: number) => {
     const fg = fgRef.current; if (!fg) return;
-    const p = fg.cameraPosition();
-    fg.cameraPosition({ x: p.x * factor, y: p.y * factor, z: p.z * factor }, undefined, 200);
+    const cam = fg.cameraPosition();
+    const target = fg.controls()?.target ?? { x: 0, y: 0, z: 0 };
+    const next = {
+      x: target.x + (cam.x - target.x) * factor,
+      y: target.y + (cam.y - target.y) * factor,
+      z: target.z + (cam.z - target.z) * factor,
+    };
+    fg.cameraPosition(next, target, 200);
   }, []);
+
+  // Orthogonal preset views. Distance scales with the current layout radius
+  // so the framing is sane for both small and large graphs. The tiny ε on
+  // the perpendicular axis avoids the gimbal-lock case where the camera's
+  // up vector becomes parallel to the view direction.
+  const topView = useCallback(() => {
+    const fg = fgRef.current; if (!fg) return;
+    const d = layoutRadius() * 1.8;
+    fg.cameraPosition({ x: 0, y: d, z: 0.01 }, { x: 0, y: 0, z: 0 }, 700);
+  }, [layoutRadius]);
+  const frontView = useCallback(() => {
+    const fg = fgRef.current; if (!fg) return;
+    const d = layoutRadius() * 1.8;
+    fg.cameraPosition({ x: 0, y: 0, z: d }, { x: 0, y: 0, z: 0 }, 700);
+  }, [layoutRadius]);
 
   if (!data) return <div><IntelTabs /><div className="card card-pad text-muted">Loading graph…</div></div>;
   const selectedNode = data.nodes.find(n => n.id === selected);
@@ -241,7 +303,7 @@ export function GraphClient() {
         <div className="card overflow-hidden relative">
           <div ref={containerRef} className="w-full h-[calc(100vh-260px)] min-h-[520px] bg-panel2">
             <ForceGraph3D
-              ref={fgRef as MutableRefObject<FG3DRef | undefined>}
+              forwardedRef={fgRef as MutableRefObject<FG3DRef | undefined>}
               graphData={graphData}
               width={size.w}
               height={size.h}
@@ -269,8 +331,8 @@ export function GraphClient() {
             <button type="button" className="btn-ghost text-sm px-2 py-1" title="Zoom out"       onClick={() => dolly(1.25)}>−</button>
             <button type="button" className="btn-ghost text-sm px-2 py-1" title="Fit all"        onClick={() => recenter()}>⤢</button>
             <button type="button" className="btn-ghost text-sm px-2 py-1" title="Center selected" onClick={() => selected && recenter(selected)} disabled={!selected}>◎</button>
-            <button type="button" className="btn-ghost text-sm px-2 py-1" title="Top view"       onClick={() => fgRef.current?.cameraPosition({ x: 0, y: 700, z: 0.01 }, { x: 0, y: 0, z: 0 }, 700)}>⬒</button>
-            <button type="button" className="btn-ghost text-sm px-2 py-1" title="Front view"     onClick={() => fgRef.current?.cameraPosition({ x: 0, y: 0, z: 700 }, { x: 0, y: 0, z: 0 }, 700)}>◧</button>
+            <button type="button" className="btn-ghost text-sm px-2 py-1" title="Top view"       onClick={topView}>⬒</button>
+            <button type="button" className="btn-ghost text-sm px-2 py-1" title="Front view"     onClick={frontView}>◧</button>
           </div>
 
           {/* Legend pinned bottom-left so newcomers can decode the colours. */}
