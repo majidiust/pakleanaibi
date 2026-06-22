@@ -196,6 +196,11 @@ export function RelationshipsClient({ role }: { role: string }) {
   );
 }
 
+// Minimal shape of an intel collection used by the manual-create form: the
+// name and the field paths (dot notation) so we can power per-collection
+// field combo boxes.
+interface CollMeta { name: string; fields: { path: string }[] }
+
 function NewRelationshipForm({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
   const [form, setForm] = useState({
     sourceCollection: '', sourceField: '',
@@ -204,6 +209,58 @@ function NewRelationshipForm({ onClose, onCreated }: { onClose: () => void; onCr
   });
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [colls, setColls] = useState<CollMeta[]>([]);
+  const [tagOptions, setTagOptions] = useState<string[]>([]);
+
+  // Fetch real collection/field metadata once when the form is mounted so
+  // every selector is a true combo: typeable, with the discovered options
+  // as drop-down suggestions. Also pull existing tags so users can re-use
+  // their vocabulary instead of typing free-form.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [cr, rr] = await Promise.all([
+          fetch('/api/intel/collections'),
+          fetch('/api/intel/relationships?status=&minConfidence=0&maxConfidence=100'),
+        ]);
+        if (cancelled) return;
+        if (cr.ok) {
+          const j = await cr.json();
+          setColls((j.collections ?? []).map((c: { name: string; fields?: { path: string }[] }) => ({
+            name: c.name, fields: c.fields ?? [],
+          })));
+        }
+        if (rr.ok) {
+          const j = await rr.json();
+          const set = new Set<string>();
+          for (const r of (j.relationships ?? []) as { tags?: string[] }[]) {
+            for (const t of (r.tags ?? [])) set.add(t);
+          }
+          setTagOptions([...set].sort());
+        }
+      } catch { /* combo boxes degrade to plain text inputs */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const collNames = useMemo(() => colls.map(c => c.name).sort(), [colls]);
+  const sourceFields = useMemo(
+    () => (colls.find(c => c.name === form.sourceCollection)?.fields ?? []).map(f => f.path),
+    [colls, form.sourceCollection],
+  );
+  const targetFields = useMemo(
+    () => (colls.find(c => c.name === form.targetCollection)?.fields ?? []).map(f => f.path),
+    [colls, form.targetCollection],
+  );
+
+  // For the tags input we let the user pick from existing tags one at a time
+  // via a combo, but the underlying form value is still comma-separated to
+  // match the existing API contract. The "current" tag being edited is the
+  // text after the last comma.
+  const tagPrefix = form.tags.includes(',')
+    ? form.tags.slice(0, form.tags.lastIndexOf(',') + 1)
+    : '';
 
   async function submit() {
     setErr(null); setBusy(true);
@@ -225,17 +282,40 @@ function NewRelationshipForm({ onClose, onCreated }: { onClose: () => void; onCr
     <div className="card card-pad mb-3 space-y-2">
       <div className="font-medium">New manual relationship</div>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-        <input className="input" placeholder="Source collection" value={form.sourceCollection} onChange={e => setForm({ ...form, sourceCollection: e.target.value })} />
-        <input className="input" placeholder="Source field" value={form.sourceField} onChange={e => setForm({ ...form, sourceField: e.target.value })} />
-        <input className="input" placeholder="Target collection" value={form.targetCollection} onChange={e => setForm({ ...form, targetCollection: e.target.value })} />
-        <input className="input" placeholder="Target field" value={form.targetField} onChange={e => setForm({ ...form, targetField: e.target.value })} />
+        <input className="input" list="rel-coll-names" placeholder="Source collection"
+               value={form.sourceCollection}
+               onChange={e => setForm({ ...form, sourceCollection: e.target.value, sourceField: '' })} />
+        <input className="input" list="rel-source-fields" placeholder="Source field"
+               value={form.sourceField}
+               onChange={e => setForm({ ...form, sourceField: e.target.value })} />
+        <input className="input" list="rel-coll-names" placeholder="Target collection"
+               value={form.targetCollection}
+               onChange={e => setForm({ ...form, targetCollection: e.target.value, targetField: '_id', targetMatchOn: '' })} />
+        <input className="input" list="rel-target-fields" placeholder="Target field"
+               value={form.targetField}
+               onChange={e => setForm({ ...form, targetField: e.target.value })} />
         <select className="input" value={form.type} onChange={e => setForm({ ...form, type: e.target.value })}>
           {REL_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
         </select>
-        <input className="input" placeholder="Match on (optional)" value={form.targetMatchOn} onChange={e => setForm({ ...form, targetMatchOn: e.target.value })} />
-        <input className="input" placeholder="Tags (comma-separated)" value={form.tags} onChange={e => setForm({ ...form, tags: e.target.value })} />
+        <input className="input" list="rel-target-fields" placeholder="Match on (optional)"
+               value={form.targetMatchOn}
+               onChange={e => setForm({ ...form, targetMatchOn: e.target.value })} />
+        <input className="input" list="rel-tag-options" placeholder="Tags (comma-separated)"
+               value={form.tags}
+               onChange={e => {
+                 const v = e.target.value;
+                 // When the user picks a suggestion via datalist, append a
+                 // trailing comma so the next pick adds to the list rather
+                 // than overwriting it.
+                 const picked = !v.endsWith(',') && tagOptions.includes(v.slice(tagPrefix.length).trim());
+                 setForm({ ...form, tags: picked ? v + ', ' : v });
+               }} />
         <input className="input" placeholder="Notes" value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })} />
       </div>
+      <datalist id="rel-coll-names">{collNames.map(n => <option key={n} value={n} />)}</datalist>
+      <datalist id="rel-source-fields">{sourceFields.map(f => <option key={f} value={f} />)}</datalist>
+      <datalist id="rel-target-fields">{targetFields.map(f => <option key={f} value={f} />)}</datalist>
+      <datalist id="rel-tag-options">{tagOptions.map(t => <option key={t} value={tagPrefix + t} />)}</datalist>
       {err && <div className="text-err text-xs">{err}</div>}
       <div className="flex justify-end gap-2">
         <button className="btn-ghost text-sm" onClick={onClose} disabled={busy}>Cancel</button>
