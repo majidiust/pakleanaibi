@@ -205,7 +205,13 @@ services:
       - "${PANEL_PORT}:3000"
     environment:
       NODE_ENV: production
-      MONGO_URI: mongodb://${SECONDARY_USERNAME}:${SECONDARY_PASSWORD}@mongo-secondary:27017/?authSource=admin
+      # Pass MongoDB connection as components; the panel builds the URI with
+      # URL-encoded userinfo, so passwords with '@' / ':' / '/' work safely.
+      MONGO_HOST: mongo-secondary
+      MONGO_PORT: 27017
+      MONGO_USERNAME: ${SECONDARY_USERNAME}
+      MONGO_PASSWORD: ${SECONDARY_PASSWORD}
+      MONGO_AUTH_SOURCE: admin
       BI_DB: ${BI_DB}
       DATA_DB: ${DATA_DB}
       ADMIN_EMAIL: ${ADMIN_EMAIL}

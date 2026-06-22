@@ -19,8 +19,26 @@ function num(name: string, def: number): number {
   return Number.isFinite(n) ? n : def;
 }
 
+// Build a mongodb:// URI from individual components, URL-encoding the
+// userinfo so that special characters in the password (e.g. '@', ':', '/')
+// don't break the parser. Falls back to MONGO_URI verbatim if components
+// aren't provided (keeps the simpler dev path working).
+function buildMongoUri(): string {
+  const user = process.env.MONGO_USERNAME;
+  const pass = process.env.MONGO_PASSWORD;
+  const host = process.env.MONGO_HOST;
+  if (user && pass && host) {
+    const port = process.env.MONGO_PORT ?? '27017';
+    const authSource = process.env.MONGO_AUTH_SOURCE ?? 'admin';
+    const extra = process.env.MONGO_PARAMS ? `&${process.env.MONGO_PARAMS}` : '';
+    return `mongodb://${encodeURIComponent(user)}:${encodeURIComponent(pass)}` +
+      `@${host}:${port}/?authSource=${encodeURIComponent(authSource)}${extra}`;
+  }
+  return req('MONGO_URI');
+}
+
 export const env = {
-  get MONGO_URI() { return req('MONGO_URI'); },
+  get MONGO_URI() { return buildMongoUri(); },
   get BI_DB() { return opt('BI_DB', 'bi'); },
   get DATA_DB() { return opt('DATA_DB', 'pakleandb'); },
 
