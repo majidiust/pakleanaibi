@@ -58,12 +58,27 @@ export function RelationshipAssistant({
         }),
       });
       if (!r.ok) {
-        const j = await r.json().catch(() => null);
-        setError(j?.error ?? `HTTP ${r.status}`);
+        const j = await r.json().catch(() => null) as { error?: string; detail?: string } | null;
+        const msg = j?.error
+          ? (j.detail ? `${j.error}: ${j.detail}` : j.error)
+          : `HTTP ${r.status}`;
+        setError(msg);
         return;
       }
-      const j = await r.json() as { message: string; suggestions: Suggestion[]; done: boolean };
-      setHistory(h => [...h, { role: 'assistant', content: j.message, suggestions: j.suggestions ?? [] }]);
+      const j = await r.json() as { message?: string; suggestions?: Suggestion[]; done?: boolean };
+      const content = (j.message ?? '').trim();
+      const suggestions = j.suggestions ?? [];
+      // Guarantee the bubble is visible even when the model returns an empty
+      // message with no suggestions — otherwise the user sees no response and
+      // assumes the send did nothing.
+      const fallback = suggestions.length
+        ? '(no message — see suggestions below)'
+        : (j.done ? '(conversation finished)' : '(no response — try rephrasing your answer)');
+      setHistory(h => [...h, {
+        role: 'assistant',
+        content: content || fallback,
+        suggestions,
+      }]);
       setDone(!!j.done);
       setStarted(true);
     } catch (e) {
@@ -221,14 +236,18 @@ export function RelationshipAssistant({
               <textarea
                 dir="auto"
                 className="input min-h-[60px] font-sans flex-1"
-                placeholder="Type your answer or follow-up…"
+                placeholder="Type your answer or follow-up… (Enter to send, Shift+Enter for newline)"
                 value={draft}
                 onChange={e => setDraft(e.target.value)}
                 onKeyDown={e => {
-                  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && draft.trim() && !loading) {
+                  // Plain Enter sends; Shift+Enter inserts a newline. Cmd/Ctrl+Enter
+                  // is kept as an alias so existing muscle memory still works.
+                  if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing
+                      && draft.trim() && !loading) {
                     e.preventDefault();
-                    void send(draft.trim());
+                    const text = draft.trim();
                     setDraft('');
+                    void send(text);
                   }
                 }}
                 disabled={loading || !canEdit}
@@ -236,7 +255,11 @@ export function RelationshipAssistant({
               <button
                 className="btn-primary btn-sm"
                 disabled={loading || !canEdit || !draft.trim()}
-                onClick={() => { void send(draft.trim()); setDraft(''); }}
+                onClick={() => {
+                  const text = draft.trim();
+                  setDraft('');
+                  void send(text);
+                }}
               >
                 Send
               </button>
