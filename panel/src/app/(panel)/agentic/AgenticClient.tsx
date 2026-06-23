@@ -121,8 +121,22 @@ export function AgenticClient({ user }: { user: ExportUser }) {
           execute: true,
         }),
       });
-      const j = (await r.json()) as TurnResponse & { error?: string; message?: string };
-      if (!r.ok) { setErr(j.message ?? j.error ?? 'request failed'); setBusy(null); return; }
+      // Tolerant body decoding: under transient backend faults (uncaught
+      // exception in the route handler, proxy 502, auth bounce to login)
+      // the response is HTML, not JSON. Parsing it blindly throws the
+      // infamous "Unexpected token '<'" and the user is stuck. Read as
+      // text first, then try to coerce — keep a short snippet so the
+      // surfaced error is debuggable.
+      const raw = await r.text();
+      let j: TurnResponse & { error?: string; message?: string } = {} as TurnResponse;
+      try { j = JSON.parse(raw); }
+      catch {
+        const snippet = raw.replace(/\s+/g, ' ').trim().slice(0, 160);
+        setErr(`Server returned a non-JSON response (HTTP ${r.status}). ${snippet ? 'Body: ' + snippet : ''}`.trim());
+        setBusy(null);
+        return;
+      }
+      if (!r.ok) { setErr(j.message ?? j.error ?? `request failed (HTTP ${r.status})`); setBusy(null); return; }
       // Build the post-turn chat: the initial assistant turn, then one
       // bubble per auto-repair attempt so the user can follow what the
       // agent did to recover from each execution failure. Always store

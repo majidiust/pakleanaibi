@@ -653,12 +653,48 @@ function versionCapsBlock(v?: { major: number; minor: number; raw: string } | nu
 // due to BSON type bracketing. We require EJSON {"$date": "..."} form for
 // every date literal; the pipeline-guard lowering pass converts those to
 // real Date objects before the query reaches MongoDB.
+// Format the current Jalali (Persian) date for the prompt. Node's Intl
+// implementation supports the persian calendar natively (ICU). We expose
+// year/month/day as plain numbers plus the canonical Persian month name
+// so the agent can pattern-match user phrasing like "خرداد ۱۴۰۵".
+const JALALI_MONTHS_FA = [
+  'فروردین', 'اردیبهشت', 'خرداد', 'تیر', 'مرداد', 'شهریور',
+  'مهر', 'آبان', 'آذر', 'دی', 'بهمن', 'اسفند',
+];
+function currentJalali(): { year: number; month: number; day: number; monthName: string } | null {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US-u-ca-persian', {
+      year: 'numeric', month: 'numeric', day: 'numeric',
+    }).formatToParts(new Date());
+    const m = Object.fromEntries(parts.map(p => [p.type, p.value])) as { year: string; month: string; day: string };
+    const month = Number(m.month);
+    return { year: Number(m.year), month, day: Number(m.day), monthName: JALALI_MONTHS_FA[month - 1] ?? String(month) };
+  } catch { return null; }
+}
+
 function dateHandlingBlock(): string {
   const now = new Date();
   const iso = now.toISOString();
   const isoMinusN = (days: number) => new Date(now.getTime() - days * 86_400_000).toISOString();
+  const jal = currentJalali();
   return [
     `Current UTC date/time: ${iso}.`,
+    jal ? `Current Jalali (Persian) date: ${jal.year}/${String(jal.month).padStart(2, '0')}/${String(jal.day).padStart(2, '0')} (${jal.monthName} ${jal.year}).` : '',
+    '',
+    'JALALI ↔ GREGORIAN CALENDAR:',
+    '- Documents in this database store dates in the GREGORIAN (Miladi) calendar as BSON Dates / ISO-8601 strings. Iranian users frequently phrase ranges in the JALALI (Shamsi / Persian) calendar — e.g. "خرداد ۱۴۰۵", "تیر ماه", "دو هفته اخیر", "از ابتدای امسال", "هفته گذشته".',
+    '- You MUST convert any Jalali phrase to its Gregorian equivalent before emitting the cutoff. Use the "Current Jalali (Persian) date" above as the anchor for any relative phrasing.',
+    '- Jalali month → approximate Gregorian span (use the precise day of crossover when the user gives a specific day):',
+    '    ۱ فروردین  ≈ 21 March    · ۱ مهر    ≈ 23 September',
+    '    ۱ اردیبهشت ≈ 21 April    · ۱ آبان   ≈ 23 October',
+    '    ۱ خرداد    ≈ 22 May      · ۱ آذر    ≈ 22 November',
+    '    ۱ تیر      ≈ 22 June     · ۱ دی     ≈ 22 December',
+    '    ۱ مرداد    ≈ 23 July     · ۱ بهمن   ≈ 21 January',
+    '    ۱ شهریور   ≈ 23 August   · ۱ اسفند  ≈ 20 February',
+    '- Persian-digit numerals (۰۱۲۳۴۵۶۷۸۹) and Arabic-Indic (٠١٢٣٤٥٦٧٨٩) are the same as 0-9; "۱۴۰۵" = 1405 (Jalali year).',
+    '- Relative phrases resolve against the CURRENT Jalali date: "هفته گذشته"/"last week" = last 7 days, "ماه گذشته" = last 30 days, "امسال" = since the most recent ۱ فروردین, "دو هفته اخیر" = last 14 days.',
+    '- When in doubt about which calendar the user meant (e.g. ambiguous "ماه ۶"), ask a clarifying question (kind="question") rather than guessing.',
+    '',
     `Common cutoff helpers (precomputed for your convenience -- use ONLY if it matches the requested range exactly, otherwise compute the right one from "Current UTC date/time"):`,
     `  last 24h cutoff: ${isoMinusN(1)}`,
     `  last  7d cutoff: ${isoMinusN(7)}`,

@@ -195,6 +195,24 @@ async function callAgent(
 
 export async function POST(req: Request) {
   try { await requireRole('admin', 'analyst'); } catch (r) { return r as Response; }
+  // Wrap the rest of the handler so any uncaught exception (LLM config
+  // error, mongo connection failure, schema-load crash, ...) becomes a
+  // structured JSON response. The agentic client parses every response
+  // as JSON, so an HTML 500 page bubbles up as a cryptic "Unexpected
+  // token '<'" error and the user can't recover.
+  try {
+    return await handleAgenticPost(req);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return NextResponse.json({
+      error: 'internal',
+      message: 'Agentic turn failed unexpectedly. Try again, or rephrase the question. ' +
+        '(Server detail: ' + msg.slice(0, 300) + ')',
+    }, { status: 500 });
+  }
+}
+
+async function handleAgenticPost(req: Request): Promise<Response> {
   const parsed = Body.safeParse(await req.json().catch(() => null));
   if (!parsed.success) {
     // Surface the first failing path so the client can show a useful hint
