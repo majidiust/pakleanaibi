@@ -130,7 +130,40 @@ export function validatePipeline(input: {
     }
   }
 
-  return { collection: input.collection, pipeline: out };
+  // Normalize bare scalar literals inside $project specs. On MongoDB 3.4
+  // (and ambiguously across other versions) any non-0/1 number on the
+  // right-hand side of a $project field is treated as inclusion of a
+  // (usually non-existent) path, so the constant value never reaches the
+  // output document. The canonical way to emit a constant is $literal.
+  // LLMs forget this routinely; we rewrite here so the table renders the
+  // intended column instead of silently dropping it.
+  const final = out.map(wrapProjectLiterals);
+  return { collection: input.collection, pipeline: final };
+}
+
+function wrapProjectLiterals(stage: Record<string, unknown>): Record<string, unknown> {
+  const op = Object.keys(stage)[0];
+  if (op !== '$project') return stage;
+  const spec = stage[op];
+  if (!spec || typeof spec !== 'object' || Array.isArray(spec)) return stage;
+  const next: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(spec as Record<string, unknown>)) {
+    next[k] = k.startsWith('$') ? v : wrapValueIfLiteral(v);
+  }
+  return { [op]: next };
+}
+
+function wrapValueIfLiteral(v: unknown): unknown {
+  // Inclusion / exclusion sentinels — preserve semantics.
+  if (v === 0 || v === 1 || v === true || v === false) return v;
+  // Field path reference — preserve.
+  if (typeof v === 'string' && v.startsWith('$')) return v;
+  // Bare numeric literal (e.g. 0.5, 100, -3) — wrap.
+  if (typeof v === 'number') return { $literal: v };
+  // Bare string literal without "$" prefix — wrap.
+  if (typeof v === 'string') return { $literal: v };
+  // Expression objects, sub-spec objects, arrays, null: leave alone.
+  return v;
 }
 
 // --- Server-version aware lowering ----------------------------------------

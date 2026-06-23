@@ -892,6 +892,20 @@ auto-repair failures):
   "done") — never wrap them in $literal unless you need to disambiguate a
   string that itself starts with "$".
 
+$project literal values:
+- Inside $project, only 0/1 (and false/true) have special meaning
+  (exclude/include). Any OTHER bare scalar — a number like 0.5, a string
+  like "yes", a constant percentage — is treated as a field path or
+  inclusion flag on legacy MongoDB and the column will silently
+  disappear from the output rows. To emit a constant, ALWAYS wrap it:
+    { "$project": { "share": 0.35, "LSH": { "$literal": 0.5 },
+                    "label": { "$literal": "high" } } }
+  Here "share" works (LLM 0.35 happens to round-trip on 4.4+) but
+  "LSH": 0.5 will be dropped on 3.4 — use $literal to be safe.
+- For computed numeric columns (multiplications, sums) keep using
+  expression objects like { "$multiply": [...] }; only bare constants
+  need the $literal wrapper.
+
 Self-repair mode:
 - The system message may contain a "Pending execution error" block. That
   is a MongoDB runtime error from the previous report you produced. Your
