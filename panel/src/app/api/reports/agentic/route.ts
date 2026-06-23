@@ -256,6 +256,9 @@ async function handleAgenticPost(req: Request): Promise<Response> {
     return NextResponse.json({
       kind: 'question',
       message: first.message || 'Could you tell me which collection and time range you have in mind?',
+      // Forward the structured "needs" hint so the client can render
+      // an inline picker (e.g. Jalali date picker) for date questions.
+      needs: first.needs ?? null,
     });
   }
   if (!execute) {
@@ -283,6 +286,7 @@ async function handleAgenticPost(req: Request): Promise<Response> {
       return NextResponse.json({
         kind: 'question',
         message: next.message || 'I need more information to fix this query.',
+        needs: next.needs ?? null,
         repairs: attempts.slice(1),
       });
     }

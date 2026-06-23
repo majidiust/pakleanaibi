@@ -327,10 +327,23 @@ export async function discoverRelationshipsFromConversation(ctx: DiscoverContext
 // (kind='question'). It may also revise a previously emitted report when
 // the user asks for changes.
 
+// When the agent's clarifying question is fundamentally a date question,
+// it can signal the UI to render a Jalali date picker by attaching a
+// `needs` hint. The user's response will then arrive in a structured
+// format (both Jalali and Gregorian ISO + ObjectId boundary) that the
+// agent can drop straight into the pipeline. The hint is optional — a
+// plain text question still works.
+export interface AgenticNeedsDate {
+  type: 'date' | 'dateRange';
+  label?: string;       // Short caption shown above the picker.
+  field?: string;       // Schema field the date will filter, e.g. "dCreateDate".
+}
+
 export interface AgenticTurn {
   kind: 'question' | 'report';
   message: string;       // Free-form text shown in the chat panel.
   report?: LlmReport;    // Present iff kind='report'.
+  needs?: AgenticNeedsDate;
 }
 
 const AGENTIC_SYSTEM = `You are a senior BI analyst running an interactive reporting session over a
@@ -398,6 +411,27 @@ Do not ask when:
 - The user already answered the same question earlier in this thread.
 - A pending execution error is present (you are in repair mode — fix it,
   don't ask).
+
+DATE-PICKER ASSIST (use whenever the clarification IS a date):
+When your clarifying question fundamentally asks the user to PICK A DATE
+or a DATE RANGE (not which date column to use — that stays plain text),
+add a "needs" object so the UI can render a Jalali date picker beside
+your question. This removes the round-trip of Persian-vs-Gregorian
+typos and ambiguous month numbers.
+  - For a single cutoff/boundary date: needs = { "type": "date",
+    "label": "<short caption>", "field": "<schema field name, optional>" }
+  - For a start/end range: needs = { "type": "dateRange",
+    "label": "<short caption>", "field": "<schema field name, optional>" }
+The user's reply will then arrive as a structured message containing:
+  • the Jalali date(s) the user clicked (for your context),
+  • the equivalent Gregorian ISO-8601 timestamps with Z (use these in
+    {"$date": "..."} literals),
+  • the equivalent ObjectId hex boundaries (use these in {"$oid": "..."}
+    literals when filtering on _id).
+Treat that reply as the authoritative answer to your date question and
+emit a kind="report" turn — do NOT ask the date again.
+Do not use "needs" for non-date questions, and never use it together
+with kind="report".
 
 Constraints on report output (when kind="report"):
 - "collection" and field names must exist in the schema (English, exact).
@@ -599,6 +633,16 @@ const AGENTIC_SCHEMA = {
   properties: {
     kind: { type: 'string', enum: ['question', 'report'] },
     message: { type: 'string' },
+    needs: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['type'],
+      properties: {
+        type: { type: 'string', enum: ['date', 'dateRange'] },
+        label: { type: 'string' },
+        field: { type: 'string' },
+      },
+    },
     report: {
       type: 'object',
       additionalProperties: false,

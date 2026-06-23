@@ -11,6 +11,12 @@ const ChatMsg = z.object({
   role: z.enum(['user', 'assistant']),
   content: z.string().max(16000),
   kind: z.enum(['question', 'report', 'repair']).optional(),
+  // See note in [id]/route.ts — kept in sync so the picker survives reload.
+  needs: z.object({
+    type: z.enum(['date', 'dateRange']),
+    label: z.string().max(200).optional(),
+    field: z.string().max(120).optional(),
+  }).optional(),
 });
 
 // The lastReport shape mirrors LlmReport but is kept loose here: we only

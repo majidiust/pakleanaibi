@@ -11,6 +11,14 @@ const ChatMsg = z.object({
   role: z.enum(['user', 'assistant']),
   content: z.string().max(16000),
   kind: z.enum(['question', 'report', 'repair']).optional(),
+  // Optional structured hint attached to a question turn (date picker, etc.)
+  // so the latest unanswered question still renders its inline UI after a
+  // page reload.
+  needs: z.object({
+    type: z.enum(['date', 'dateRange']),
+    label: z.string().max(200).optional(),
+    field: z.string().max(120).optional(),
+  }).optional(),
 });
 
 const Patch = z.object({

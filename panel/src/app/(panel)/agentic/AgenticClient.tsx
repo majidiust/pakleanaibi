@@ -6,6 +6,8 @@ import { SaveTemplateModal } from './SaveTemplateModal';
 import { FieldAttacher, type AttachedField } from './FieldAttacher';
 import { ConversationHistory } from './ConversationHistory';
 import { exportConversation, type ExportableConversation, type ExportUser } from './exportConversation';
+import { JalaliDatePicker, type JalaliPickerResult } from '@/components/JalaliDatePicker';
+import { formatJalaliISO, formatJalaliLong, jalaliRangeBoundaries, jalaliToUtcDate, objectIdBoundary } from '@/lib/jalali';
 
 interface LlmReport {
   collection: string;
@@ -16,13 +18,24 @@ interface LlmReport {
 }
 interface Execution { ok: boolean; rows?: Record<string, unknown>[]; took?: number; count?: number; truncated?: boolean; error?: string }
 interface RepairAttempt { message: string; report: LlmReport; execution: Execution }
-interface ChatMsg { role: 'user' | 'assistant'; content: string; kind?: 'question' | 'report' | 'repair' }
+// `needs` is a structured hint from the agent that the current question is a
+// date pick: the UI renders an inline Jalali calendar instead of relying on
+// the user to type an ISO timestamp. Only set on the most recent assistant
+// turn; cleared implicitly when a new turn arrives.
+export interface AgenticNeedsDate { type: 'date' | 'dateRange'; label?: string; field?: string }
+interface ChatMsg {
+  role: 'user' | 'assistant';
+  content: string;
+  kind?: 'question' | 'report' | 'repair';
+  needs?: AgenticNeedsDate;
+}
 interface TurnResponse {
   kind: 'question' | 'report';
   message: string;
   report?: LlmReport;
   execution?: Execution | null;
   repairs?: RepairAttempt[];
+  needs?: AgenticNeedsDate | null;
 }
 
 const EXAMPLES = [
@@ -146,7 +159,13 @@ export function AgenticClient({ user }: { user: ExportUser }) {
       const primaryContent = (j.message?.trim()
         || j.report?.explanation?.trim()
         || (j.kind === 'report' ? '(produced a report)' : '(no message)'));
-      const appended: ChatMsg[] = [{ role: 'assistant', content: primaryContent, kind: j.kind }];
+      const appended: ChatMsg[] = [{
+        role: 'assistant',
+        content: primaryContent,
+        kind: j.kind,
+        // Only attach `needs` to question turns — reports are terminal.
+        ...(j.kind === 'question' && j.needs ? { needs: j.needs } : {}),
+      }];
       for (const rep of j.repairs ?? []) {
         const verdict = rep.execution.ok
           ? ` ✓ (${rep.execution.count ?? rep.execution.rows?.length ?? 0} rows)`
@@ -163,6 +182,54 @@ export function AgenticClient({ user }: { user: ExportUser }) {
       setErr(e instanceof Error ? e.message : 'request failed');
     } finally { setBusy(null); }
   }, [history, report, busy, attached, conversationId]);
+
+  // When the agent asked a date question (kind=question + needs={type:date|dateRange})
+  // and the user picked a date in the inline Jalali calendar, we format the
+  // selection as a richly-structured user message and send it back as the
+  // next turn. The message includes BOTH the Jalali form (for the agent's
+  // context / its echo back to the user) and the canonical Gregorian ISO
+  // plus an ObjectId boundary, so the agent can paste either form directly
+  // into the pipeline without any further conversion.
+  const submitPickedDate = useCallback((needs: AgenticNeedsDate, result: JalaliPickerResult) => {
+    const fieldNote = needs.field ? ` (intended for field: \`${needs.field}\`)` : '';
+    let text: string;
+    if (result.mode === 'single') {
+      const j = result.start;
+      const utc = jalaliToUtcDate(j.jy, j.jm, j.jd, 0, 0, 0, 0);
+      const iso = utc.toISOString();
+      const oid = objectIdBoundary(utc);
+      text = [
+        `📅 Date answer${fieldNote}:`,
+        `- Jalali: ${formatJalaliLong(j)} (${formatJalaliISO(j)})`,
+        `- Gregorian (UTC, start of day): ${iso}`,
+        `- ObjectId boundary: ${oid}`,
+        `Use this in the pipeline as {"$date": "${iso}"} for date fields, or {"$oid": "${oid}"} when filtering on _id.`,
+      ].join('\n');
+    } else {
+      const { startIso, endIso, startOid, endOid } = jalaliRangeBoundaries(result.start, result.end);
+      text = [
+        `📅 Date-range answer${fieldNote}:`,
+        `- Jalali range: ${formatJalaliISO(result.start)} → ${formatJalaliISO(result.end)} (${formatJalaliLong(result.start)} → ${formatJalaliLong(result.end)})`,
+        `- Gregorian range (UTC, $gte start / $lt end-exclusive):`,
+        `    start = ${startIso}`,
+        `    end   = ${endIso}`,
+        `- ObjectId range (same semantics): start = ${startOid}, end = ${endOid}`,
+        `Suggested filter on a date field: { "$gte": {"$date":"${startIso}"}, "$lt": {"$date":"${endIso}"} }`,
+        `Suggested _id fallback:          { "$gte": {"$oid":"${startOid}"},  "$lt": {"$oid":"${endOid}"} }`,
+      ].join('\n');
+    }
+    // Strip `needs` from the assistant turn so the picker closes immediately
+    // on submit (otherwise it would briefly re-render before sendTurn updates).
+    setHistory(h => h.map((m, i) => i === h.length - 1 && m.role === 'assistant' ? { ...m, needs: undefined } : m));
+    void sendTurn(text);
+  }, [sendTurn]);
+
+  // Cancel the picker without sending anything: just strip `needs` from the
+  // last assistant turn so the inline calendar disappears. The user can then
+  // type a free-form reply if they wanted to.
+  const dismissPicker = useCallback(() => {
+    setHistory(h => h.map((m, i) => i === h.length - 1 && m.role === 'assistant' ? { ...m, needs: undefined } : m));
+  }, []);
 
   // Autosave: whenever the conversation has been created and the history /
   // last report change, PATCH the server after a short debounce. Skips
@@ -315,6 +382,8 @@ export function AgenticClient({ user }: { user: ExportUser }) {
           onExample={(s) => { setInput(s); }}
           showExamples={history.length === 0}
           attached={attached} onAttachedChange={setAttached}
+          onPickedDate={submitPickedDate}
+          onDismissPicker={dismissPicker}
         />
       </div>
 
@@ -424,13 +493,19 @@ function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, can
   );
 }
 
-function ChatPanel({ history, input, busy, chatRef, onInput, onSend, onExample, showExamples, attached, onAttachedChange }: {
+function ChatPanel({ history, input, busy, chatRef, onInput, onSend, onExample, showExamples, attached, onAttachedChange, onPickedDate, onDismissPicker }: {
   history: ChatMsg[]; input: string; busy: 'turn' | 'exec' | null;
   chatRef: React.RefObject<HTMLDivElement>;
   onInput: (v: string) => void; onSend: () => void;
   onExample: (s: string) => void; showExamples: boolean;
   attached: AttachedField[]; onAttachedChange: (next: AttachedField[]) => void;
+  onPickedDate: (needs: AgenticNeedsDate, result: JalaliPickerResult) => void;
+  onDismissPicker: () => void;
 }) {
+  // Render the date picker only inside the MOST RECENT assistant question
+  // that still carries a `needs` hint. We compare by index so earlier turns
+  // (which are immutable history) don't re-open the calendar.
+  const lastIdx = history.length - 1;
   return (
     <div className="card flex flex-col h-[min(720px,calc(100vh-180px))] sticky top-4 min-w-0">
       <div className="px-4 py-3 border-b border-line flex items-center justify-between">
@@ -444,21 +519,33 @@ function ChatPanel({ history, input, busy, chatRef, onInput, onSend, onExample, 
             otherwise produce and run a read-only MongoDB pipeline.
           </div>
         )}
-        {history.map((m, i) => (
-          <div key={i} className={m.role === 'user' ? 'flex justify-end' : 'flex justify-start'}>
-            <div dir="auto" className={[
-              'max-w-[88%] rounded-lg px-3 py-2 text-sm whitespace-pre-wrap leading-relaxed',
-              m.role === 'user'
-                ? 'bg-accent/15 text-ink border border-accent-lo/40'
-                : 'bg-panel2/70 text-ink-2 border border-line',
-            ].join(' ')}>
-              {m.kind === 'report' && <div className="text-2xs text-accent-hi mb-1 uppercase tracking-[0.08em]">report</div>}
-              {m.kind === 'question' && <div className="text-2xs text-warn mb-1 uppercase tracking-[0.08em]">clarify</div>}
-              {m.kind === 'repair' && <div className="text-2xs text-warn mb-1 uppercase tracking-[0.08em]">auto-repair</div>}
-              {m.content}
+        {history.map((m, i) => {
+          const showPicker = i === lastIdx && m.role === 'assistant' && !!m.needs;
+          return (
+            <div key={i} className={m.role === 'user' ? 'flex justify-end' : 'flex justify-start'}>
+              <div dir="auto" className={[
+                'max-w-[88%] rounded-lg px-3 py-2 text-sm whitespace-pre-wrap leading-relaxed',
+                m.role === 'user'
+                  ? 'bg-accent/15 text-ink border border-accent-lo/40'
+                  : 'bg-panel2/70 text-ink-2 border border-line',
+              ].join(' ')}>
+                {m.kind === 'report' && <div className="text-2xs text-accent-hi mb-1 uppercase tracking-[0.08em]">report</div>}
+                {m.kind === 'question' && <div className="text-2xs text-warn mb-1 uppercase tracking-[0.08em]">clarify</div>}
+                {m.kind === 'repair' && <div className="text-2xs text-warn mb-1 uppercase tracking-[0.08em]">auto-repair</div>}
+                {m.content}
+                {showPicker && m.needs && (
+                  <JalaliDatePicker
+                    mode={m.needs.type === 'dateRange' ? 'range' : 'single'}
+                    label={m.needs.label || (m.needs.type === 'dateRange' ? 'Pick the date range' : 'Pick the date')}
+                    fieldHint={m.needs.field}
+                    onConfirm={(r) => onPickedDate(m.needs!, r)}
+                    onCancel={onDismissPicker}
+                  />
+                )}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
         {busy === 'turn' && (
           <div className="flex justify-start">
             <div className="bg-panel2/70 text-muted border border-line rounded-lg px-3 py-2 text-sm">
