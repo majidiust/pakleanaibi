@@ -11,7 +11,7 @@ import {
   type SortingState,
 } from '@tanstack/react-table';
 import { ExportModal } from './ExportModal';
-import { CellValue } from './CellValue';
+import { CellValue, CellRenderContext } from './CellValue';
 
 export function DataTable({ rows, title }: { rows: Record<string, unknown>[]; title?: string }) {
   const [sorting, setSorting] = useState<SortingState>([]);
@@ -81,6 +81,7 @@ export function DataTable({ rows, title }: { rows: Record<string, unknown>[]; ti
   const innerWrap = expanded ? 'card card-pad flex flex-col flex-1 min-h-0 min-w-0 space-y-3' : '';
 
   return (
+    <CellRenderContext.Provider value={{ full: expanded }}>
     <div className={outerCls}>
       <div className={innerWrap}>
       <div className="flex items-center justify-between gap-3 flex-wrap">
@@ -185,5 +186,6 @@ export function DataTable({ rows, title }: { rows: Record<string, unknown>[]; ti
       )}
       </div>
     </div>
+    </CellRenderContext.Provider>
   );
 }

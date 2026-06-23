@@ -1,5 +1,11 @@
 'use client';
-import { useState, useMemo } from 'react';
+import { createContext, useContext, useState, useMemo } from 'react';
+
+// Render-mode flag plumbed from DataTable (and similar containers) so cell
+// renderers can show fuller content when there's room. `full` is true when
+// the table is in fullscreen / expanded mode — used by the OID branch to
+// drop the 6…4 abbreviation in favour of the complete 24-char value.
+export const CellRenderContext = createContext<{ full: boolean }>({ full: false });
 
 // Recursive structure-aware cell renderer for the agentic + saved-reports
 // tables. The previous implementation stringified every non-scalar to JSON,
@@ -53,6 +59,7 @@ function fmtNumber(n: number): string {
 export function CellValue({ v, depth = 0 }: { v: unknown; depth?: number }) {
   const kind = classify(v);
   const [expanded, setExpanded] = useState(false);
+  const { full } = useContext(CellRenderContext);
 
   switch (kind) {
     case 'null':
@@ -65,6 +72,7 @@ export function CellValue({ v, depth = 0 }: { v: unknown; depth?: number }) {
       return <span className="num text-xs text-ink-2" title={v instanceof Date ? v.toISOString() : String(v)}>{fmtDate(v)}</span>;
     case 'oid': {
       const s = String(v);
+      if (full) return <span className="font-mono text-2xs text-muted" title={s}>{s}</span>;
       return <span className="font-mono text-2xs text-muted" title={s}>{s.slice(0, 6)}…{s.slice(-4)}</span>;
     }
     case 'string': {
