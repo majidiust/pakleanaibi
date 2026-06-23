@@ -49,7 +49,7 @@ export const env = {
   get JWT_TTL_HOURS() { return num('JWT_TTL_HOURS', 12); },
 
   get OPENAI_API_KEY() { return opt('OPENAI_API_KEY', ''); },
-  get OPENAI_MODEL() { return opt('OPENAI_MODEL', 'gpt-4o-mini'); },
+  get OPENAI_MODEL() { return opt('OPENAI_MODEL', 'gpt-4o'); },
   // Output token cap for LLM completions. Long agentic reports (10+ pipeline
   // stages + Persian explanation) routinely exceed the API's small default
   // and get truncated mid-JSON, which produces an unparseable body. gpt-4o /

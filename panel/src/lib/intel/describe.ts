@@ -134,7 +134,7 @@ export async function describeCollections(collections: IntelCollection[]):
           { role: 'system', content: SYSTEM },
           { role: 'user', content: compactPrompt(batch) },
         ],
-        response_format: { type: 'json_schema', json_schema: { name: 'descriptions', schema: RESP_SCHEMA, strict: false } },
+        response_format: { type: 'json_schema', json_schema: { name: 'descriptions', schema: RESP_SCHEMA, strict: true } },
       });
       void recordUsage({
         op: 'intel.describe', model: resp.model ?? env.OPENAI_MODEL,

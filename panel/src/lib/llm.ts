@@ -76,6 +76,44 @@ class LlmJsonError extends Error {
   }
 }
 
+// Decode the pipeline-as-string field emitted by the strict-mode schema and
+// shape the raw object into an LlmReport. Accepts both the new string form
+// AND the legacy array form so a cached/old conversation still works.
+function decodeReport(raw: unknown, opName: string): LlmReport {
+  const o = (raw ?? {}) as Record<string, unknown>;
+  let pipeline: Record<string, unknown>[] = [];
+  if (Array.isArray(o.pipeline)) {
+    pipeline = o.pipeline as Record<string, unknown>[];
+  } else if (typeof o.pipeline === 'string') {
+    let inner: unknown;
+    try { inner = JSON.parse(o.pipeline); }
+    catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(`${opName}: pipeline string is not valid JSON: ${msg}`);
+    }
+    if (!Array.isArray(inner)) throw new Error(`${opName}: pipeline JSON decoded to ${typeof inner}, expected array`);
+    pipeline = inner as Record<string, unknown>[];
+  } else {
+    throw new Error(`${opName}: pipeline is missing or wrong type (${typeof o.pipeline})`);
+  }
+  const display = (o.display ?? {}) as Record<string, unknown>;
+  const cleanStr = (v: unknown): string | undefined =>
+    typeof v === 'string' && v.length > 0 ? v : undefined;
+  return {
+    collection: String(o.collection ?? ''),
+    pipeline,
+    display: {
+      kind: (display.kind as LlmReport['display']['kind']) ?? 'table',
+      xField: cleanStr(display.xField),
+      yField: cleanStr(display.yField),
+      seriesField: cleanStr(display.seriesField),
+      title: cleanStr(display.title),
+    },
+    explanation: String(o.explanation ?? ''),
+    warnings: Array.isArray(o.warnings) ? (o.warnings as unknown[]).filter((w): w is string => typeof w === 'string') : [],
+  };
+}
+
 function parseLlmJson(resp: ChatCompletion, opName: string): unknown {
   const choice = resp.choices[0];
   if (!choice) throw new Error(`${opName}: LLM returned no choices`);
@@ -130,7 +168,8 @@ Language:
 
 Hard constraints:
 - Output JSON only, matching the provided JSON schema.
-- "pipeline" MUST be a valid MongoDB aggregation pipeline (array of stages).
+- "pipeline" is a JSON-ENCODED STRING whose decoded value is a non-empty array of stage objects. Example: "[{\\"$match\\":{\\"status\\":\\"done\\"}},{\\"$limit\\":1000}]". Escape inner quotes with \\" — do NOT emit a raw array.
+- The decoded pipeline MUST be a valid MongoDB aggregation pipeline (array of stages).
 - Allowed stages only: $match, $project, $group, $sort, $limit, $skip, $count,
   $addFields, $set, $unset, $unwind, $replaceRoot, $replaceWith, $bucket,
   $bucketAuto, $facet, $sortByCount, $lookup, $densify.
@@ -147,23 +186,34 @@ Display selection:
 - "pie" only if there are <= 8 distinct categories.
 - Otherwise "table".`;
 
+// Strict-mode compatible schema. Notes:
+// - OpenAI Structured Outputs in strict mode requires every property to be
+//   listed in `required`. Optional fields use `["<type>", "null"]` and the
+//   model emits `null` when absent.
+// - The aggregation pipeline is an array of arbitrarily-shaped $-operator
+//   objects; strict mode can't represent "any object", so we transport it as
+//   a JSON-encoded string and parse it back server-side (the recommended
+//   workaround per the Structured Outputs docs).
 const SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['collection', 'pipeline', 'display', 'explanation'],
+  required: ['collection', 'pipeline', 'display', 'explanation', 'warnings'],
   properties: {
     collection: { type: 'string' },
-    pipeline: { type: 'array', items: { type: 'object' } },
+    pipeline: {
+      type: 'string',
+      description: 'A JSON-encoded array of MongoDB aggregation pipeline stages, e.g. \'[{"$match":{"x":1}},{"$limit":100}]\'. Must parse as a JSON array of objects.',
+    },
     display: {
       type: 'object',
       additionalProperties: false,
-      required: ['kind'],
+      required: ['kind', 'xField', 'yField', 'seriesField', 'title'],
       properties: {
         kind: { type: 'string', enum: ['table', 'bar', 'line', 'pie', 'area'] },
-        xField: { type: 'string' },
-        yField: { type: 'string' },
-        seriesField: { type: 'string' },
-        title: { type: 'string' },
+        xField: { type: ['string', 'null'] },
+        yField: { type: ['string', 'null'] },
+        seriesField: { type: ['string', 'null'] },
+        title: { type: ['string', 'null'] },
       },
     },
     explanation: { type: 'string' },
@@ -185,7 +235,7 @@ export async function generateReport(question: string, digest: SchemaDigest): Pr
     ],
     response_format: {
       type: 'json_schema',
-      json_schema: { name: 'report', schema: SCHEMA, strict: false },
+      json_schema: { name: 'report', schema: SCHEMA, strict: true },
     },
   });
   void recordUsage({
@@ -194,7 +244,7 @@ export async function generateReport(question: string, digest: SchemaDigest): Pr
     completionTokens: resp.usage?.completion_tokens ?? 0,
     durationMs: Date.now() - t0,
   });
-  return parseLlmJson(resp, 'report.generate') as LlmReport;
+  return decodeReport(parseLlmJson(resp, 'report.generate'), 'report.generate');
 }
 
 // ----- Repair / refine ------------------------------------------------------
@@ -318,21 +368,21 @@ const DISCOVER_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['source', 'target', 'type', 'confidence', 'reason'],
+        required: ['source', 'target', 'type', 'cardinality', 'confidence', 'reason', 'signals'],
         properties: {
           source: {
             type: 'object', additionalProperties: false, required: ['collection', 'field'],
             properties: { collection: { type: 'string' }, field: { type: 'string' } },
           },
           target: {
-            type: 'object', additionalProperties: false, required: ['collection', 'field'],
+            type: 'object', additionalProperties: false, required: ['collection', 'field', 'matchOn'],
             properties: {
               collection: { type: 'string' }, field: { type: 'string' },
-              matchOn: { type: 'string' },
+              matchOn: { type: ['string', 'null'] },
             },
           },
           type: { type: 'string', enum: ['one-to-one','one-to-many','many-to-one','many-to-many','embedded','soft','derived','chain'] },
-          cardinality: { type: 'string', enum: ['1:1','1:N','N:1','N:N'] },
+          cardinality: { type: ['string', 'null'], description: 'One of "1:1" | "1:N" | "N:1" | "N:N", or null when unknown.' },
           confidence: { type: 'number' },
           reason: { type: 'string' },
           signals: { type: 'array', items: { type: 'string' } },
@@ -379,7 +429,7 @@ export async function discoverRelationshipsFromConversation(ctx: DiscoverContext
     ],
     response_format: {
       type: 'json_schema',
-      json_schema: { name: 'discover', schema: DISCOVER_SCHEMA, strict: false },
+      json_schema: { name: 'discover', schema: DISCOVER_SCHEMA, strict: true },
     },
   });
   void recordUsage({
@@ -388,12 +438,19 @@ export async function discoverRelationshipsFromConversation(ctx: DiscoverContext
     completionTokens: resp.usage?.completion_tokens ?? 0,
     durationMs: Date.now() - t0,
   });
-  const out = parseLlmJson(resp, 'intel.discover') as DiscoverReply;
-  // Defensive defaults.
-  out.suggestions = Array.isArray(out.suggestions) ? out.suggestions : [];
-  out.done = !!out.done;
-  out.message = String(out.message ?? '');
-  return out;
+  const raw = parseLlmJson(resp, 'intel.discover') as DiscoverReply;
+  // Strict mode requires the model to emit nullable optional fields
+  // explicitly. Coerce nulls back to `undefined` for the downstream UI
+  // and drop any cardinality value that isn't one of our canonical labels.
+  const allowedCard = new Set(['1:1', '1:N', 'N:1', 'N:N']);
+  const suggestions = Array.isArray(raw.suggestions) ? raw.suggestions : [];
+  for (const s of suggestions) {
+    const t = s.target as RelSuggestion['target'] & { matchOn?: string | null };
+    if (t.matchOn === null) delete t.matchOn;
+    const c = s as RelSuggestion & { cardinality?: string | null };
+    if (c.cardinality === null || (c.cardinality && !allowedCard.has(c.cardinality))) delete c.cardinality;
+  }
+  return { message: String(raw.message ?? ''), done: !!raw.done, suggestions };
 }
 
 // ----- Agentic (multi-turn) reporting -------------------------------------
@@ -439,10 +496,14 @@ Your job, per turn, is to decide ONE of:
 
 CRITICAL output rules:
 - If kind="report", the "report" object is MANDATORY and must include all
-  of: collection (string), pipeline (non-empty array), display (object
-  with a "kind" enum value), explanation (string). Never produce kind=
-  "report" without a populated "report" object.
-- If kind="question", do NOT include a report.
+  of: collection (string), pipeline (JSON-encoded string of stages),
+  display (object with a "kind" enum value), explanation (string).
+  pipeline is transported as a JSON-encoded STRING, not a raw array —
+  example: "[{\\"$match\\":{\\"status\\":\\"done\\"}},{\\"$limit\\":1000}]".
+  Escape inner quotes with \\". Never produce kind="report" without a
+  populated "report" object.
+- If kind="question", set "report" to null.
+- Set "needs" to null when the clarifying question is NOT a date pick.
 - "message" must NEVER be a narration of intent like "Retrieving …" or
   "Let me fetch …". Either ask a real question or ship the report.
 
@@ -702,45 +763,62 @@ Language:
   (Persian/Farsi, Arabic, English, ...). Field, collection and operator
   names stay in English as in the schema.`;
 
+// Strict-mode shape: every property listed in `required`; optional values
+// expressed as nullable. `pipeline` is JSON-encoded because aggregation
+// stages have arbitrary $-operator keys and strict mode cannot describe a
+// "free-form object" — we decode the string back into an array server-side.
 const AGENTIC_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['kind', 'message'],
+  required: ['kind', 'message', 'needs', 'report'],
   properties: {
     kind: { type: 'string', enum: ['question', 'report'] },
     message: { type: 'string' },
     needs: {
-      type: 'object',
-      additionalProperties: false,
-      required: ['type'],
-      properties: {
-        type: { type: 'string', enum: ['date', 'dateRange'] },
-        label: { type: 'string' },
-        field: { type: 'string' },
-      },
-    },
-    report: {
-      type: 'object',
-      additionalProperties: false,
-      required: ['collection', 'pipeline', 'display', 'explanation'],
-      properties: {
-        collection: { type: 'string' },
-        pipeline: { type: 'array', items: { type: 'object' } },
-        display: {
+      anyOf: [
+        {
           type: 'object',
           additionalProperties: false,
-          required: ['kind'],
+          required: ['type', 'label', 'field'],
           properties: {
-            kind: { type: 'string', enum: ['table', 'bar', 'line', 'pie', 'area'] },
-            xField: { type: 'string' },
-            yField: { type: 'string' },
-            seriesField: { type: 'string' },
-            title: { type: 'string' },
+            type: { type: 'string', enum: ['date', 'dateRange'] },
+            label: { type: ['string', 'null'] },
+            field: { type: ['string', 'null'] },
           },
         },
-        explanation: { type: 'string' },
-        warnings: { type: 'array', items: { type: 'string' } },
-      },
+        { type: 'null' },
+      ],
+    },
+    report: {
+      anyOf: [
+        {
+          type: 'object',
+          additionalProperties: false,
+          required: ['collection', 'pipeline', 'display', 'explanation', 'warnings'],
+          properties: {
+            collection: { type: 'string' },
+            pipeline: {
+              type: 'string',
+              description: 'A JSON-encoded array of MongoDB aggregation pipeline stages. Example: \'[{"$match":{"x":1}},{"$limit":100}]\'.',
+            },
+            display: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['kind', 'xField', 'yField', 'seriesField', 'title'],
+              properties: {
+                kind: { type: 'string', enum: ['table', 'bar', 'line', 'pie', 'area'] },
+                xField: { type: ['string', 'null'] },
+                yField: { type: ['string', 'null'] },
+                seriesField: { type: ['string', 'null'] },
+                title: { type: ['string', 'null'] },
+              },
+            },
+            explanation: { type: 'string' },
+            warnings: { type: 'array', items: { type: 'string' } },
+          },
+        },
+        { type: 'null' },
+      ],
     },
   },
 } as const;
@@ -879,7 +957,7 @@ export async function agenticReport(ctx: AgenticContext, digest: SchemaDigest): 
       ],
       response_format: {
         type: 'json_schema',
-        json_schema: { name: 'agentic_turn', schema: AGENTIC_SCHEMA, strict: false },
+        json_schema: { name: 'agentic_turn', schema: AGENTIC_SCHEMA, strict: true },
       },
     });
     void recordUsage({
@@ -888,7 +966,25 @@ export async function agenticReport(ctx: AgenticContext, digest: SchemaDigest): 
       completionTokens: resp.usage?.completion_tokens ?? 0,
       durationMs: Date.now() - t0,
     });
-    return parseLlmJson(resp, 'report.agentic') as AgenticTurn;
+    // Strict-mode payload: `report` and `needs` are nullable, and the
+    // nested report.pipeline is a JSON-encoded string. Decode + coerce
+    // back into the historic AgenticTurn shape the rest of the app
+    // expects (`report: LlmReport | undefined`, `needs: ... | undefined`).
+    const raw = parseLlmJson(resp, 'report.agentic') as {
+      kind: 'question' | 'report';
+      message: string;
+      needs: AgenticTurn['needs'] | null;
+      report: unknown | null;
+    };
+    const turn: AgenticTurn = {
+      kind: raw.kind,
+      message: String(raw.message ?? ''),
+    };
+    if (raw.needs && typeof raw.needs === 'object') turn.needs = raw.needs;
+    if (raw.report && typeof raw.report === 'object') {
+      turn.report = decodeReport(raw.report, 'report.agentic');
+    }
+    return turn;
   }
   let out: AgenticTurn;
   try {
@@ -900,7 +996,6 @@ export async function agenticReport(ctx: AgenticContext, digest: SchemaDigest): 
       );
     } else throw e;
   }
-  out.message = String(out.message ?? '');
   if (out.kind === 'report' && !out.report) throw new Error('LLM returned kind=report without a report object');
   return out;
 }
@@ -927,7 +1022,7 @@ export async function repairReport(ctx: RepairContext, digest: SchemaDigest): Pr
     ],
     response_format: {
       type: 'json_schema',
-      json_schema: { name: 'report', schema: SCHEMA, strict: false },
+      json_schema: { name: 'report', schema: SCHEMA, strict: true },
     },
   });
   void recordUsage({
@@ -936,5 +1031,5 @@ export async function repairReport(ctx: RepairContext, digest: SchemaDigest): Pr
     completionTokens: resp.usage?.completion_tokens ?? 0,
     durationMs: Date.now() - t0,
   });
-  return parseLlmJson(resp, 'report.repair') as LlmReport;
+  return decodeReport(parseLlmJson(resp, 'report.repair'), 'report.repair');
 }
