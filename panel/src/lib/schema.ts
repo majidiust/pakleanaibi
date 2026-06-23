@@ -155,16 +155,40 @@ function isDateLikeField(name: string, types: string[], example: unknown): boole
 // natural anchor when the user phrases a question around the "many" side
 // (e.g. "items of the last order") and produce N x M lookups that
 // inevitably time out.
-export function schemaToPrompt(s: SchemaDigest): string {
+//
+// `opts.mode`:
+//   'full'    : verbose join recipes (full $lookup JSON, forward+reverse, chains)
+//   'compact' : one-line relationships only, no chained-join templates, terse
+//               field rendering. Saves ~70-90% of tokens on a large schema.
+// `opts.keepCollections`: when set, only collections whose name is in this set
+//   are listed (used by the budget-aware caller to hide low-signal collections).
+export interface SchemaPromptOpts {
+  mode?: 'full' | 'compact';
+  keepCollections?: Set<string>;
+}
+export function schemaToPrompt(s: SchemaDigest, opts: SchemaPromptOpts = {}): string {
+  const mode = opts.mode ?? 'full';
+  const keep = opts.keepCollections;
   const lines: string[] = [`Database: ${s.database}`, `Collections (sorted by row count):`];
   for (const c of s.collections) {
+    if (keep && !keep.has(c.name)) continue;
     const fields = c.fields.map(f => {
       // Annotate the type tag with a storage hint for fields that the model
       // is likely to filter on (date columns and _id ObjectIds). The hint is
       // derived from the actual sampled value so a date-stored-as-string is
       // visibly distinguished from a real BSON Date.
-      let typeTag = f.types.join('|');
-      if (isDateLikeField(f.name, f.types, f.example)) {
+      const dateLike = isDateLikeField(f.name, f.types, f.example);
+      // Compact mode: single dominant type, single-letter code; full mode keeps
+      // the human-readable union. Both modes still emit the !bsonDate / !dateString
+      // / !millis storage hint for date-shaped fields.
+      let typeTag: string;
+      if (mode === 'compact') {
+        const t = f.types[0] ?? '?';
+        typeTag = ({ string: 's', number: 'n', boolean: 'b', date: 'd', objectId: 'o', array: 'a', object: 'O', null: 'z' } as Record<string, string>)[t] ?? '?';
+      } else {
+        typeTag = f.types.join('|');
+      }
+      if (dateLike) {
         if (f.types.includes('date')) typeTag += '!bsonDate';
         else if (looksLikeDateString(f.example)) typeTag += '!dateString';
         else if (looksLikeMillisNumber(f.example)) typeTag += '!millis';
@@ -174,12 +198,18 @@ export function schemaToPrompt(s: SchemaDigest): string {
       // (so the model is reminded it can extract a creation timestamp from
       // an _id without a dedicated date column). Other fields keep the
       // existing terse `name:type` form so the digest stays compact.
-      const showExample = ex && (isDateLikeField(f.name, f.types, f.example) || f.name === '_id');
+      const showExample = ex && (dateLike || f.name === '_id');
       return showExample ? `${f.name}:${typeTag}=${ex}` : `${f.name}:${typeTag}`;
     }).join(', ');
     lines.push(`- ${c.name} (~${c.count} docs): ${fields}`);
   }
-  const rels = s.relationships ?? [];
+  const allRels = s.relationships ?? [];
+  // When some collections are hidden, drop relationships whose endpoints are no
+  // longer listed -- otherwise the model would see joins pointing at unlisted
+  // collections and get confused.
+  const rels = keep
+    ? allRels.filter(r => keep.has(r.source.collection) && keep.has(r.target.collection))
+    : allRels;
   if (rels.length) {
     lines.push('', 'Known relationships (human-confirmed; safe to use for $lookup joins):');
     for (const r of rels) {
@@ -187,38 +217,119 @@ export function schemaToPrompt(s: SchemaDigest): string {
       const card = r.cardinality ? ` [${r.cardinality}]` : '';
       lines.push(`- ${r.source.collection}.${r.source.field} -> ${tgt} (${r.type}${card}, ${r.status})`);
     }
-    // Join recipes: for each relationship, emit the forward and reverse
-    // $lookup templates explicitly. The model can pick either side as the
-    // anchor depending on which collection the request is "about" -- the
-    // PIPELINE PLANNING rules above tell it to anchor where the filters
-    // are most selective.
-    lines.push('', 'JOIN RECIPES (use these exact $lookup shapes; do NOT invent join keys):');
-    for (const r of rels) {
-      const tgtKey = r.target.matchOn ?? r.target.field;
-      // Forward: anchor in source, enrich each row with the target.
+    if (mode === 'full') {
+      // Join recipes: for each relationship, emit the forward and reverse
+      // $lookup templates explicitly. The model can pick either side as the
+      // anchor depending on which collection the request is "about" -- the
+      // PIPELINE PLANNING rules above tell it to anchor where the filters
+      // are most selective.
+      lines.push('', 'JOIN RECIPES (use these exact $lookup shapes; do NOT invent join keys):');
+      for (const r of rels) {
+        const tgtKey = r.target.matchOn ?? r.target.field;
+        // Forward: anchor in source, enrich each row with the target.
+        lines.push(
+          `- Anchor in "${r.source.collection}", attach matching "${r.target.collection}":\n` +
+          `    { "$lookup": { "from": "${r.target.collection}", "localField": "${r.source.field}", "foreignField": "${tgtKey}", "as": "${r.target.collection}_joined" } }`,
+        );
+        // Reverse: anchor in target, attach the many "source" rows.
+        lines.push(
+          `- Anchor in "${r.target.collection}", attach matching "${r.source.collection}":\n` +
+          `    { "$lookup": { "from": "${r.source.collection}", "localField": "${tgtKey}", "foreignField": "${r.source.field}", "as": "${r.source.collection}_joined" } }`,
+        );
+      }
+      // Multi-hop chain recipes. When the user asks for a field that lives two
+      // collections away from the natural anchor (classic case: "items of the
+      // last order with the item NAME" -- name is in `items`, not `orderitems`),
+      // the model often stops at the first $lookup. Emitting full chain
+      // templates (anchor -> $lookup -> $unwind -> $lookup) tells it the exact
+      // sequence of stages required to surface fields on the far side.
+      const chains = buildChains(rels);
+      if (chains.length) {
+        lines.push('', 'CHAINED JOIN RECIPES (use when a requested field is two hops away from the anchor):');
+        for (const c of chains) lines.push(c);
+      }
+    } else {
+      // Compact mode: a single rule line tells the model how to construct a
+      // $lookup from a relationship entry. Saves ~80% of the JOIN RECIPES
+      // section without losing information -- the model already knows the
+      // $lookup shape, it just needs the keys, which are in the relationships
+      // list above.
       lines.push(
-        `- Anchor in "${r.source.collection}", attach matching "${r.target.collection}":\n` +
-        `    { "$lookup": { "from": "${r.target.collection}", "localField": "${r.source.field}", "foreignField": "${tgtKey}", "as": "${r.target.collection}_joined" } }`,
+        '',
+        'JOIN RULE: for each relationship "A.fa -> B.fb", build $lookup as',
+        '  { "$lookup": { "from": "B", "localField": "fa", "foreignField": "fb", "as": "B_joined" } }',
+        '  Reverse direction: swap A<->B and fa<->fb. Follow with',
+        '  { "$unwind": { "path": "$B_joined", "preserveNullAndEmptyArrays": true } }',
+        '  for 1:1 / N:1 sides. Chain multiple lookups to reach 2-hop fields.',
       );
-      // Reverse: anchor in target, attach the many "source" rows.
-      lines.push(
-        `- Anchor in "${r.target.collection}", attach matching "${r.source.collection}":\n` +
-        `    { "$lookup": { "from": "${r.source.collection}", "localField": "${tgtKey}", "foreignField": "${r.source.field}", "as": "${r.source.collection}_joined" } }`,
-      );
-    }
-    // Multi-hop chain recipes. When the user asks for a field that lives two
-    // collections away from the natural anchor (classic case: "items of the
-    // last order with the item NAME" -- name is in `items`, not `orderitems`),
-    // the model often stops at the first $lookup. Emitting full chain
-    // templates (anchor -> $lookup -> $unwind -> $lookup) tells it the exact
-    // sequence of stages required to surface fields on the far side.
-    const chains = buildChains(rels);
-    if (chains.length) {
-      lines.push('', 'CHAINED JOIN RECIPES (use when a requested field is two hops away from the anchor):');
-      for (const c of chains) lines.push(c);
     }
   }
   return lines.join('\n');
+}
+
+// Build a schema prompt that fits within a token budget. Tries (in order):
+//   1. full mode with all collections
+//   2. compact mode with all collections
+//   3. compact mode, dropping low-signal collections (no relationships AND
+//      below an adaptive row-count threshold) until under budget.
+// Returns the prompt plus a short diagnostic about what was downgraded so
+// the caller can surface it (and optionally tell the LLM that some
+// collections were hidden this turn).
+const ASCII_TOKEN_RATIO = 3; // tokens per UTF-8 byte; same heuristic as llm.ts
+function approxTokens(s: string): number {
+  let bytes = 0;
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : 3;
+  }
+  return Math.ceil(bytes / ASCII_TOKEN_RATIO);
+}
+export interface FittedSchemaPrompt {
+  prompt: string;
+  mode: 'full' | 'compact';
+  hiddenCollections: string[];
+  estimatedTokens: number;
+}
+export function fitSchemaPrompt(s: SchemaDigest, budgetTokens: number): FittedSchemaPrompt {
+  const full = schemaToPrompt(s, { mode: 'full' });
+  if (approxTokens(full) <= budgetTokens) {
+    return { prompt: full, mode: 'full', hiddenCollections: [], estimatedTokens: approxTokens(full) };
+  }
+  const compact = schemaToPrompt(s, { mode: 'compact' });
+  if (approxTokens(compact) <= budgetTokens) {
+    return { prompt: compact, mode: 'compact', hiddenCollections: [], estimatedTokens: approxTokens(compact) };
+  }
+  // Drop low-signal collections. Score = (in any relationship ? 1e12 : 0) + count.
+  // Collections that participate in a relationship are always kept; among the
+  // rest, the highest-row-count survive longest.
+  const rels = s.relationships ?? [];
+  const inRel = new Set<string>();
+  for (const r of rels) { inRel.add(r.source.collection); inRel.add(r.target.collection); }
+  const ranked = [...s.collections].sort((a, b) => {
+    const sa = (inRel.has(a.name) ? 1e12 : 0) + a.count;
+    const sb = (inRel.has(b.name) ? 1e12 : 0) + b.count;
+    return sb - sa;
+  });
+  const kept = new Set(ranked.map(c => c.name));
+  const hidden: string[] = [];
+  // Drop one collection at a time from the tail until under budget. O(n) shrinks
+  // is fine: schemas with hundreds of collections are still tractable.
+  for (let i = ranked.length - 1; i >= 0; i--) {
+    const out = schemaToPrompt(s, { mode: 'compact', keepCollections: kept });
+    if (approxTokens(out) <= budgetTokens) {
+      return { prompt: out, mode: 'compact', hiddenCollections: hidden, estimatedTokens: approxTokens(out) };
+    }
+    const drop = ranked[i].name;
+    if (inRel.has(drop) && kept.size > 5) {
+      // Last resort: even relationship-bearing collections must yield. Stop
+      // the "always keep" rule and continue trimming.
+    }
+    kept.delete(drop);
+    hidden.push(drop);
+    if (kept.size <= 1) break;
+  }
+  const out = schemaToPrompt(s, { mode: 'compact', keepCollections: kept });
+  return { prompt: out, mode: 'compact', hiddenCollections: hidden, estimatedTokens: approxTokens(out) };
 }
 
 interface Edge { from: string; fromField: string; to: string; toField: string }

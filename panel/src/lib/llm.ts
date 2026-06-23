@@ -2,7 +2,7 @@ import OpenAI from 'openai';
 import type { ChatCompletion } from 'openai/resources/chat/completions';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { env } from './env';
-import { schemaToPrompt, type SchemaDigest } from './schema';
+import { fitSchemaPrompt, type SchemaDigest } from './schema';
 import { recordUsage } from './llm-cost';
 
 // ----- OpenAI client (singleton; optional SOCKS5 proxy support) -------------
@@ -204,6 +204,29 @@ function computeBudget(estimatedFixedAndHistory: number): { inputBudget: number;
   return { inputBudget, clampedOutput };
 }
 
+// Build the "Max rows + schema digest" system message under a token budget,
+// downgrading from full to compact and finally hiding low-signal collections
+// when the digest would not otherwise fit. Returns the rendered text plus a
+// short note about any downgrades so the system prompt can disclose them to
+// the model (helps it ask the user about a missing collection rather than
+// silently hallucinate).
+function buildSchemaContext(digest: SchemaDigest, otherFixedTokens: number): string {
+  // Reserve room for: AGENTIC_SYSTEM (or SYSTEM/REPAIR_SYSTEM), version caps,
+  // date rules, history, lastReport echo, completion, safety. Pass the sum
+  // as otherFixedTokens. Whatever's left after the safety/output margin is
+  // available for the digest itself.
+  const safetyMargin = 800;
+  const window = env.OPENAI_CONTEXT_WINDOW;
+  const wantOutput = env.OPENAI_MAX_OUTPUT_TOKENS;
+  const schemaBudget = Math.max(2000, window - wantOutput - otherFixedTokens - safetyMargin);
+  const fitted = fitSchemaPrompt(digest, schemaBudget);
+  const header = `Max rows: ${env.REPORT_MAX_ROWS}. Schema digest:`;
+  const note = fitted.hiddenCollections.length
+    ? `\n\nNOTE: ${fitted.hiddenCollections.length} low-signal collection(s) were hidden from this digest to fit the context window. If the user references a collection you don't see, ask them to name it explicitly.`
+    : '';
+  return `${header}\n${fitted.prompt}${note}`;
+}
+
 // Decode the pipeline-as-string field emitted by the strict-mode schema and
 // shape the raw object into an LlmReport. Accepts both the new string form
 // AND the legacy array form so a cached/old conversation still works.
@@ -351,10 +374,15 @@ const SCHEMA = {
 
 export async function generateReport(question: string, digest: SchemaDigest): Promise<LlmReport> {
   const c = client();
-  const messages: Msg[] = [
+  const sysAndUser: Msg[] = [
     { role: 'system', content: SYSTEM },
-    { role: 'system', content: `Max rows: ${env.REPORT_MAX_ROWS}. Schema digest:\n${schemaToPrompt(digest)}` },
     { role: 'user', content: question },
+  ];
+  const otherFixed = messagesTokens(sysAndUser);
+  const messages: Msg[] = [
+    sysAndUser[0],
+    { role: 'system', content: buildSchemaContext(digest, otherFixed) },
+    sysAndUser[1],
   ];
   const { clampedOutput } = computeBudget(messagesTokens(messages));
   const t0 = Date.now();
@@ -1060,21 +1088,13 @@ function dateHandlingBlock(): string {
 
 export async function agenticReport(ctx: AgenticContext, digest: SchemaDigest): Promise<AgenticTurn> {
   const c = client();
-  // Build the fixed (inviolable) system context separately from the variable
-  // pieces so the fitter can shrink the trimmable parts (lastReport echo,
-  // older history) without touching the schema digest or version rules.
-  const fixed: Msg[] = [
-    { role: 'system', content: AGENTIC_SYSTEM },
-    {
-      role: 'system',
-      content: [
-        `Max rows: ${env.REPORT_MAX_ROWS}.`,
-        versionCapsBlock(ctx.serverVersion),
-        dateHandlingBlock(),
-        `Schema digest:\n${schemaToPrompt(digest)}`,
-      ].filter(Boolean).join('\n\n'),
-    },
-  ];
+  // Compute the schema digest budget after subtracting everything else fixed
+  // (AGENTIC_SYSTEM + version caps + date rules + history + lastReport echo).
+  // The schema is the single largest piece on most installs, so giving it an
+  // explicit budget (rather than a hard string) is what keeps us inside the
+  // 128k window when the user has many collections.
+  const versionCaps = versionCapsBlock(ctx.serverVersion);
+  const dateHandling = dateHandlingBlock();
   const lastReportEcho = ctx.lastReport
     ? { full: JSON.stringify(ctx.lastReport, null, 2), summary: summariseReport(ctx.lastReport) }
     : null;
@@ -1082,6 +1102,20 @@ export async function agenticReport(ctx: AgenticContext, digest: SchemaDigest): 
     ? { role: 'system', content: `Pending execution error from the previous report — diagnose and emit a CORRECTED report this turn:\n${ctx.pendingError}` }
     : null;
   const history: Msg[] = ctx.history.map(m => ({ role: m.role, content: m.content }));
+
+  // Token cost of everything except the schema digest itself.
+  const nonSchemaFixed = estimateTokens(AGENTIC_SYSTEM) + estimateTokens(versionCaps) + estimateTokens(dateHandling) + 24;
+  const nonSchemaVariable = messagesTokens(history)
+    + (pendingError ? messagesTokens([pendingError]) : 0)
+    + (lastReportEcho ? estimateTokens(lastReportEcho.full) + 8 : 0);
+  const schemaCtx = buildSchemaContext(digest, nonSchemaFixed + nonSchemaVariable);
+
+  const fixed: Msg[] = [
+    { role: 'system', content: AGENTIC_SYSTEM },
+    ...(versionCaps ? [{ role: 'system' as const, content: versionCaps }] : []),
+    { role: 'system', content: dateHandling },
+    { role: 'system', content: schemaCtx },
+  ];
 
   // Two-pass: if the first response is truncated, retry once with the prior
   // truncated body as context and a terse instruction to emit a more compact
@@ -1153,10 +1187,11 @@ export async function repairReport(ctx: RepairContext, digest: SchemaDigest): Pr
     ctx.refinement ? `User refinement instruction (any language):\n${ctx.refinement}` : '',
   ].filter(Boolean).join('\n\n');
 
+  const otherFixed = estimateTokens(SYSTEM) + estimateTokens(REPAIR_SYSTEM) + estimateTokens(context) + 16;
   const messages: Msg[] = [
     { role: 'system', content: SYSTEM },
     { role: 'system', content: REPAIR_SYSTEM },
-    { role: 'system', content: `Max rows: ${env.REPORT_MAX_ROWS}. Schema digest:\n${schemaToPrompt(digest)}` },
+    { role: 'system', content: buildSchemaContext(digest, otherFixed) },
     { role: 'user',   content: context },
   ];
   const { clampedOutput } = computeBudget(messagesTokens(messages));
