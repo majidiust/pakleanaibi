@@ -1,4 +1,5 @@
 import OpenAI from 'openai';
+import type { ChatCompletion } from 'openai/resources/chat/completions';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { env } from './env';
 import { schemaToPrompt, type SchemaDigest } from './schema';
@@ -18,6 +19,87 @@ function client(): OpenAI {
   }
   _client = new OpenAI(opts);
   return _client;
+}
+
+// ----- Tolerant JSON parsing for LLM outputs --------------------------------
+// Strips common wrappers (markdown code fences, "Here is the JSON:" preambles)
+// and then JSON.parse. If the body looks truncated (open braces/brackets
+// without their close), attempts a one-shot completion of trailing structure
+// so a long, otherwise-valid pipeline isn't lost.
+function stripJsonWrappers(s: string): string {
+  let t = s.trim();
+  // ```json ... ``` or ``` ... ```
+  const fence = t.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fence) t = fence[1].trim();
+  // First '{' or '[' wins -- some models prepend "Sure, here you go:\n".
+  const firstObj = t.indexOf('{');
+  const firstArr = t.indexOf('[');
+  const first = firstObj === -1 ? firstArr : firstArr === -1 ? firstObj : Math.min(firstObj, firstArr);
+  if (first > 0) t = t.slice(first);
+  return t;
+}
+
+function tryRepairTruncated(s: string): string | null {
+  // Heuristic: count unmatched openers OUTSIDE of strings and append closers.
+  // Handles the common case of `"$lt": "2026-06-01T00...` being cut mid-string.
+  let inStr = false;
+  let esc = false;
+  const stack: string[] = [];
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (esc) { esc = false; continue; }
+    if (ch === '\\') { esc = true; continue; }
+    if (ch === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (ch === '{' || ch === '[') stack.push(ch);
+    else if (ch === '}') { if (stack[stack.length - 1] === '{') stack.pop(); }
+    else if (ch === ']') { if (stack[stack.length - 1] === '[') stack.pop(); }
+  }
+  if (!inStr && stack.length === 0) return null; // not actually truncated
+  let tail = '';
+  if (inStr) tail += '"';
+  // Trailing comma after the last value is illegal -- drop one if present.
+  let head = s.replace(/,\s*$/, '');
+  // If we cut in the middle of `"key":` with no value, drop the dangling key.
+  head = head.replace(/,\s*"[^"\n]*"\s*:\s*$/, '');
+  head = head.replace(/"[^"\n]*"\s*:\s*$/, '');
+  while (stack.length) {
+    const op = stack.pop()!;
+    tail += op === '{' ? '}' : ']';
+  }
+  return head + tail;
+}
+
+class LlmJsonError extends Error {
+  constructor(msg: string, public readonly snippet: string, public readonly truncated: boolean) {
+    super(msg);
+  }
+}
+
+function parseLlmJson(resp: ChatCompletion, opName: string): unknown {
+  const choice = resp.choices[0];
+  if (!choice) throw new Error(`${opName}: LLM returned no choices`);
+  const msg = choice.message as { content?: string | null; refusal?: string | null };
+  if (msg.refusal) throw new Error(`${opName}: LLM refused: ${msg.refusal}`);
+  const content = msg.content;
+  if (!content) throw new Error(`${opName}: LLM returned empty response`);
+  const finish = choice.finish_reason;
+  const truncated = finish === 'length';
+  const cleaned = stripJsonWrappers(content);
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    // Try to repair trailing truncation before giving up.
+    const repaired = tryRepairTruncated(cleaned);
+    if (repaired) {
+      try { return JSON.parse(repaired); } catch { /* fall through */ }
+    }
+    const snippet = cleaned.length > 240 ? cleaned.slice(0, 120) + ' … ' + cleaned.slice(-120) : cleaned;
+    const reason = truncated
+      ? `output was truncated at the ${env.OPENAI_MAX_OUTPUT_TOKENS}-token cap (finish_reason=length). Raise OPENAI_MAX_OUTPUT_TOKENS or ask for a smaller pipeline`
+      : `output was not valid JSON (finish_reason=${finish ?? 'unknown'})`;
+    throw new LlmJsonError(`${opName}: ${reason}. Snippet: ${snippet}`, snippet, truncated);
+  }
 }
 
 // ----- Response shape (validated downstream) --------------------------------
@@ -95,6 +177,7 @@ export async function generateReport(question: string, digest: SchemaDigest): Pr
   const resp = await c.chat.completions.create({
     model: env.OPENAI_MODEL,
     temperature: 0.1,
+    max_tokens: env.OPENAI_MAX_OUTPUT_TOKENS,
     messages: [
       { role: 'system', content: SYSTEM },
       { role: 'system', content: `Max rows: ${env.REPORT_MAX_ROWS}. Schema digest:\n${schemaToPrompt(digest)}` },
@@ -111,11 +194,7 @@ export async function generateReport(question: string, digest: SchemaDigest): Pr
     completionTokens: resp.usage?.completion_tokens ?? 0,
     durationMs: Date.now() - t0,
   });
-  const content = resp.choices[0]?.message?.content;
-  if (!content) throw new Error('LLM returned empty response');
-  let parsed: unknown;
-  try { parsed = JSON.parse(content); } catch { throw new Error('LLM output was not valid JSON'); }
-  return parsed as LlmReport;
+  return parseLlmJson(resp, 'report.generate') as LlmReport;
 }
 
 // ----- Repair / refine ------------------------------------------------------
@@ -292,6 +371,7 @@ export async function discoverRelationshipsFromConversation(ctx: DiscoverContext
   const resp = await c.chat.completions.create({
     model: env.OPENAI_MODEL,
     temperature: 0.2,
+    max_tokens: env.OPENAI_MAX_OUTPUT_TOKENS,
     messages: [
       { role: 'system', content: DISCOVER_SYSTEM },
       { role: 'system', content: contextToPrompt(ctx) },
@@ -308,11 +388,7 @@ export async function discoverRelationshipsFromConversation(ctx: DiscoverContext
     completionTokens: resp.usage?.completion_tokens ?? 0,
     durationMs: Date.now() - t0,
   });
-  const content = resp.choices[0]?.message?.content;
-  if (!content) throw new Error('LLM returned empty response');
-  let parsed: unknown;
-  try { parsed = JSON.parse(content); } catch { throw new Error('LLM output was not valid JSON'); }
-  const out = parsed as DiscoverReply;
+  const out = parseLlmJson(resp, 'intel.discover') as DiscoverReply;
   // Defensive defaults.
   out.suggestions = Array.isArray(out.suggestions) ? out.suggestions : [];
   out.done = !!out.done;
@@ -786,31 +862,44 @@ export async function agenticReport(ctx: AgenticContext, digest: SchemaDigest): 
       ? `Pending execution error from the previous report — diagnose and emit a CORRECTED report this turn:\n${ctx.pendingError}`
       : '',
   ].filter(Boolean).join('\n\n');
-  const t0 = Date.now();
-  const resp = await c.chat.completions.create({
-    model: env.OPENAI_MODEL,
-    temperature: 0.15,
-    messages: [
-      { role: 'system', content: AGENTIC_SYSTEM },
-      { role: 'system', content: sysCtx },
-      ...ctx.history.map(m => ({ role: m.role, content: m.content })),
-    ],
-    response_format: {
-      type: 'json_schema',
-      json_schema: { name: 'agentic_turn', schema: AGENTIC_SCHEMA, strict: false },
-    },
-  });
-  void recordUsage({
-    op: 'report.agentic', model: resp.model ?? env.OPENAI_MODEL,
-    promptTokens: resp.usage?.prompt_tokens ?? 0,
-    completionTokens: resp.usage?.completion_tokens ?? 0,
-    durationMs: Date.now() - t0,
-  });
-  const content = resp.choices[0]?.message?.content;
-  if (!content) throw new Error('LLM returned empty response');
-  let parsed: unknown;
-  try { parsed = JSON.parse(content); } catch { throw new Error('LLM output was not valid JSON'); }
-  const out = parsed as AgenticTurn;
+  // Two-pass: if the first response is truncated, retry once with the prior
+  // truncated body as context and a terse instruction to emit a more compact
+  // pipeline. Long $project blocks are the usual culprit.
+  async function call(extra?: string): Promise<AgenticTurn> {
+    const t0 = Date.now();
+    const resp = await c.chat.completions.create({
+      model: env.OPENAI_MODEL,
+      temperature: 0.15,
+      max_tokens: env.OPENAI_MAX_OUTPUT_TOKENS,
+      messages: [
+        { role: 'system', content: AGENTIC_SYSTEM },
+        { role: 'system', content: sysCtx },
+        ...ctx.history.map(m => ({ role: m.role, content: m.content })),
+        ...(extra ? [{ role: 'system' as const, content: extra }] : []),
+      ],
+      response_format: {
+        type: 'json_schema',
+        json_schema: { name: 'agentic_turn', schema: AGENTIC_SCHEMA, strict: false },
+      },
+    });
+    void recordUsage({
+      op: 'report.agentic', model: resp.model ?? env.OPENAI_MODEL,
+      promptTokens: resp.usage?.prompt_tokens ?? 0,
+      completionTokens: resp.usage?.completion_tokens ?? 0,
+      durationMs: Date.now() - t0,
+    });
+    return parseLlmJson(resp, 'report.agentic') as AgenticTurn;
+  }
+  let out: AgenticTurn;
+  try {
+    out = await call();
+  } catch (e) {
+    if (e instanceof LlmJsonError && e.truncated) {
+      out = await call(
+        'PREVIOUS_ATTEMPT_WAS_TRUNCATED: your last response exceeded the output token cap and was discarded. Re-emit a strictly valid JSON answer. Keep the pipeline focused: prefer a shorter $project (only fields the user asked for), drop optional warnings, and keep the explanation under 4 sentences.',
+      );
+    } else throw e;
+  }
   out.message = String(out.message ?? '');
   if (out.kind === 'report' && !out.report) throw new Error('LLM returned kind=report without a report object');
   return out;
@@ -829,6 +918,7 @@ export async function repairReport(ctx: RepairContext, digest: SchemaDigest): Pr
   const resp = await c.chat.completions.create({
     model: env.OPENAI_MODEL,
     temperature: 0.1,
+    max_tokens: env.OPENAI_MAX_OUTPUT_TOKENS,
     messages: [
       { role: 'system', content: SYSTEM },
       { role: 'system', content: REPAIR_SYSTEM },
@@ -846,9 +936,5 @@ export async function repairReport(ctx: RepairContext, digest: SchemaDigest): Pr
     completionTokens: resp.usage?.completion_tokens ?? 0,
     durationMs: Date.now() - t0,
   });
-  const content = resp.choices[0]?.message?.content;
-  if (!content) throw new Error('LLM returned empty response');
-  let parsed: unknown;
-  try { parsed = JSON.parse(content); } catch { throw new Error('LLM output was not valid JSON'); }
-  return parsed as LlmReport;
+  return parseLlmJson(resp, 'report.repair') as LlmReport;
 }

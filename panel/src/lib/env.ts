@@ -50,6 +50,11 @@ export const env = {
 
   get OPENAI_API_KEY() { return opt('OPENAI_API_KEY', ''); },
   get OPENAI_MODEL() { return opt('OPENAI_MODEL', 'gpt-4o-mini'); },
+  // Output token cap for LLM completions. Long agentic reports (10+ pipeline
+  // stages + Persian explanation) routinely exceed the API's small default
+  // and get truncated mid-JSON, which produces an unparseable body. gpt-4o /
+  // gpt-4o-mini support up to 16384 output tokens; 8000 is a safe headroom.
+  get OPENAI_MAX_OUTPUT_TOKENS() { return num('OPENAI_MAX_OUTPUT_TOKENS', 8000); },
   get OPENAI_USE_PROXY() { return opt('OPENAI_USE_PROXY', 'false') === 'true'; },
   get PROXY_TYPE() { return opt('PROXY_TYPE', 'socks5'); },
   get PROXY_HOST() { return opt('PROXY_HOST', '127.0.0.1'); },
