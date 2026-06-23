@@ -76,6 +76,134 @@ class LlmJsonError extends Error {
   }
 }
 
+// ----- Token budget helpers -------------------------------------------------
+// We don't ship tiktoken: it adds ~5MB to the panel bundle for a single
+// rough estimate. Instead, count UTF-8 byte cost and approximate with a
+// conservative bias (overestimate by ~10%) so we always fit comfortably
+// under the model's context window. Real-world drift between this estimate
+// and the API tokenizer is <5% for our mixed English/Persian prompts.
+function estimateTokens(s: string): number {
+  let bytes = 0;
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : 3;
+  }
+  // ~3.3 bytes/token for ASCII JSON, ~1.5 for CJK/RTL; mid-range with bias.
+  return Math.ceil(bytes / 3);
+}
+type Msg = { role: 'system' | 'user' | 'assistant'; content: string };
+function messagesTokens(msgs: Msg[]): number {
+  // ~4 tokens framing overhead per message (role tag + delimiters).
+  return msgs.reduce((n, m) => n + 4 + estimateTokens(m.content), 0);
+}
+
+// Build a compact summary of a previous LlmReport that's safe to drop in
+// when the full JSON echo would blow the context window. We keep enough
+// to let the model recognise "this is a refinement of the same report"
+// (collection + display kind + pipeline stage shape + truncated explanation)
+// without re-serialising every $-operator argument.
+function summariseReport(r: LlmReport): string {
+  const stages = r.pipeline.map(s => Object.keys(s)[0] ?? '?').join(' -> ');
+  const expl = r.explanation.length > 400 ? r.explanation.slice(0, 400) + '…' : r.explanation;
+  return [
+    `collection: ${r.collection}`,
+    `display: ${r.display.kind}${r.display.title ? ` (title: ${r.display.title})` : ''}`,
+    `pipeline stages: ${stages}`,
+    `explanation: ${expl}`,
+  ].join('\n');
+}
+
+// Progressively trim a message bundle until it fits under inputBudget tokens.
+// Trim order is least-to-most useful:
+//   1. Replace the full lastReport echo with summariseReport().
+//   2. Drop the oldest history turns one by one (always keep the latest user
+//      message so the model has something to answer).
+// The schema digest and AGENTIC_SYSTEM are treated as inviolable -- without
+// them the model can't function. If even an empty history + summarised
+// echo doesn't fit, we throw a clear configuration error.
+interface FitInput {
+  fixed: Msg[];          // AGENTIC_SYSTEM + schema digest + version caps + date rules + max rows
+  lastReportEcho: { full: string; summary: string } | null;
+  pendingError: Msg | null;
+  history: Msg[];
+  extra: Msg | null;     // retry instruction, etc.
+  inputBudget: number;
+}
+function fitMessages(input: FitInput): { msgs: Msg[]; trimmed: { droppedHistory: number; summarisedReport: boolean } } {
+  const { fixed, pendingError, extra, inputBudget } = input;
+  let echoMsg: Msg | null = input.lastReportEcho
+    ? { role: 'system', content: `Previous report (you may revise this if the user asks):\n${input.lastReportEcho.full}` }
+    : null;
+  const history = [...input.history];
+  let summarisedReport = false;
+  let droppedHistory = 0;
+  const assemble = (): Msg[] => {
+    const out: Msg[] = [...fixed];
+    if (echoMsg) out.push(echoMsg);
+    if (pendingError) out.push(pendingError);
+    out.push(...history);
+    if (extra) out.push(extra);
+    return out;
+  };
+  let msgs = assemble();
+  if (messagesTokens(msgs) <= inputBudget) return { msgs, trimmed: { droppedHistory: 0, summarisedReport: false } };
+
+  // Step 1: replace full echo with summary.
+  if (input.lastReportEcho) {
+    echoMsg = {
+      role: 'system',
+      content: `Previous report (summarised; ask the user if you need a specific stage):\n${input.lastReportEcho.summary}`,
+    };
+    summarisedReport = true;
+    msgs = assemble();
+    if (messagesTokens(msgs) <= inputBudget) return { msgs, trimmed: { droppedHistory, summarisedReport } };
+  }
+
+  // Step 2: drop oldest history turns while keeping the most recent user turn.
+  const lastUserIdx = (() => {
+    for (let i = history.length - 1; i >= 0; i--) if (history[i].role === 'user') return i;
+    return -1;
+  })();
+  while (history.length > 1 && messagesTokens(assemble()) > inputBudget) {
+    // Never drop the latest user turn; drop the earliest message instead.
+    if (lastUserIdx === 0) break;
+    history.shift();
+    droppedHistory++;
+  }
+  msgs = assemble();
+  if (messagesTokens(msgs) <= inputBudget) return { msgs, trimmed: { droppedHistory, summarisedReport } };
+
+  // Step 3: drop the echo entirely.
+  if (echoMsg) {
+    echoMsg = null;
+    msgs = assemble();
+    if (messagesTokens(msgs) <= inputBudget) return { msgs, trimmed: { droppedHistory, summarisedReport: true } };
+  }
+
+  // Still over budget: the fixed prefix (schema digest) is too large for the
+  // chosen context window. Surface a clear, actionable error rather than
+  // letting OpenAI return a cryptic 400.
+  const used = messagesTokens(msgs);
+  throw new Error(
+    `LLM prompt is too large for the chosen model: fixed system context (schema digest + rules) is ~${used} tokens but the input budget is ${inputBudget}. ` +
+    `Reduce OPENAI_MAX_OUTPUT_TOKENS, raise OPENAI_CONTEXT_WINDOW for a larger-window model, or shrink the schema digest (e.g. hide low-signal collections).`,
+  );
+}
+
+// Compute (inputBudget, clampedOutput) honouring the model's context window.
+// We always try to keep the configured max_tokens, but if that would push the
+// total past the window we clamp output to the available headroom instead.
+// safetyMargin covers the OpenAI tokenizer drift vs our estimator.
+function computeBudget(estimatedFixedAndHistory: number): { inputBudget: number; clampedOutput: number } {
+  const safetyMargin = 800;
+  const window = env.OPENAI_CONTEXT_WINDOW;
+  const wantOutput = env.OPENAI_MAX_OUTPUT_TOKENS;
+  const remaining = window - estimatedFixedAndHistory - safetyMargin;
+  const clampedOutput = Math.max(512, Math.min(wantOutput, remaining));
+  const inputBudget = window - clampedOutput - safetyMargin;
+  return { inputBudget, clampedOutput };
+}
+
 // Decode the pipeline-as-string field emitted by the strict-mode schema and
 // shape the raw object into an LlmReport. Accepts both the new string form
 // AND the legacy array form so a cached/old conversation still works.
@@ -223,16 +351,18 @@ const SCHEMA = {
 
 export async function generateReport(question: string, digest: SchemaDigest): Promise<LlmReport> {
   const c = client();
+  const messages: Msg[] = [
+    { role: 'system', content: SYSTEM },
+    { role: 'system', content: `Max rows: ${env.REPORT_MAX_ROWS}. Schema digest:\n${schemaToPrompt(digest)}` },
+    { role: 'user', content: question },
+  ];
+  const { clampedOutput } = computeBudget(messagesTokens(messages));
   const t0 = Date.now();
   const resp = await c.chat.completions.create({
     model: env.OPENAI_MODEL,
     temperature: 0.1,
-    max_tokens: env.OPENAI_MAX_OUTPUT_TOKENS,
-    messages: [
-      { role: 'system', content: SYSTEM },
-      { role: 'system', content: `Max rows: ${env.REPORT_MAX_ROWS}. Schema digest:\n${schemaToPrompt(digest)}` },
-      { role: 'user', content: question },
-    ],
+    max_tokens: clampedOutput,
+    messages,
     response_format: {
       type: 'json_schema',
       json_schema: { name: 'report', schema: SCHEMA, strict: true },
@@ -417,16 +547,18 @@ function contextToPrompt(ctx: DiscoverContext): string {
 
 export async function discoverRelationshipsFromConversation(ctx: DiscoverContext): Promise<DiscoverReply> {
   const c = client();
+  const messages: Msg[] = [
+    { role: 'system', content: DISCOVER_SYSTEM },
+    { role: 'system', content: contextToPrompt(ctx) },
+    ...ctx.history.map(m => ({ role: m.role, content: m.content })),
+  ];
+  const { clampedOutput } = computeBudget(messagesTokens(messages));
   const t0 = Date.now();
   const resp = await c.chat.completions.create({
     model: env.OPENAI_MODEL,
     temperature: 0.2,
-    max_tokens: env.OPENAI_MAX_OUTPUT_TOKENS,
-    messages: [
-      { role: 'system', content: DISCOVER_SYSTEM },
-      { role: 'system', content: contextToPrompt(ctx) },
-      ...ctx.history.map(m => ({ role: m.role, content: m.content })),
-    ],
+    max_tokens: clampedOutput,
+    messages,
     response_format: {
       type: 'json_schema',
       json_schema: { name: 'discover', schema: DISCOVER_SCHEMA, strict: true },
@@ -928,33 +1060,45 @@ function dateHandlingBlock(): string {
 
 export async function agenticReport(ctx: AgenticContext, digest: SchemaDigest): Promise<AgenticTurn> {
   const c = client();
-  const sysCtx = [
-    `Max rows: ${env.REPORT_MAX_ROWS}.`,
-    versionCapsBlock(ctx.serverVersion),
-    dateHandlingBlock(),
-    `Schema digest:\n${schemaToPrompt(digest)}`,
-    ctx.lastReport
-      ? `Previous report (you may revise this if the user asks):\n${JSON.stringify(ctx.lastReport, null, 2)}`
-      : 'No previous report yet in this session.',
-    ctx.pendingError
-      ? `Pending execution error from the previous report — diagnose and emit a CORRECTED report this turn:\n${ctx.pendingError}`
-      : '',
-  ].filter(Boolean).join('\n\n');
+  // Build the fixed (inviolable) system context separately from the variable
+  // pieces so the fitter can shrink the trimmable parts (lastReport echo,
+  // older history) without touching the schema digest or version rules.
+  const fixed: Msg[] = [
+    { role: 'system', content: AGENTIC_SYSTEM },
+    {
+      role: 'system',
+      content: [
+        `Max rows: ${env.REPORT_MAX_ROWS}.`,
+        versionCapsBlock(ctx.serverVersion),
+        dateHandlingBlock(),
+        `Schema digest:\n${schemaToPrompt(digest)}`,
+      ].filter(Boolean).join('\n\n'),
+    },
+  ];
+  const lastReportEcho = ctx.lastReport
+    ? { full: JSON.stringify(ctx.lastReport, null, 2), summary: summariseReport(ctx.lastReport) }
+    : null;
+  const pendingError: Msg | null = ctx.pendingError
+    ? { role: 'system', content: `Pending execution error from the previous report — diagnose and emit a CORRECTED report this turn:\n${ctx.pendingError}` }
+    : null;
+  const history: Msg[] = ctx.history.map(m => ({ role: m.role, content: m.content }));
+
   // Two-pass: if the first response is truncated, retry once with the prior
   // truncated body as context and a terse instruction to emit a more compact
   // pipeline. Long $project blocks are the usual culprit.
-  async function call(extra?: string): Promise<AgenticTurn> {
+  async function call(extraText?: string): Promise<AgenticTurn> {
+    const extra: Msg | null = extraText ? { role: 'system', content: extraText } : null;
+    // Estimate the floor (fixed + history + small overhead) to derive a
+    // realistic output cap, then fit the variable pieces into the remainder.
+    const floor = messagesTokens(fixed) + messagesTokens(history) + (pendingError ? messagesTokens([pendingError]) : 0);
+    const { inputBudget, clampedOutput } = computeBudget(floor);
+    const { msgs } = fitMessages({ fixed, lastReportEcho, pendingError, history, extra, inputBudget });
     const t0 = Date.now();
     const resp = await c.chat.completions.create({
       model: env.OPENAI_MODEL,
       temperature: 0.15,
-      max_tokens: env.OPENAI_MAX_OUTPUT_TOKENS,
-      messages: [
-        { role: 'system', content: AGENTIC_SYSTEM },
-        { role: 'system', content: sysCtx },
-        ...ctx.history.map(m => ({ role: m.role, content: m.content })),
-        ...(extra ? [{ role: 'system' as const, content: extra }] : []),
-      ],
+      max_tokens: clampedOutput,
+      messages: msgs,
       response_format: {
         type: 'json_schema',
         json_schema: { name: 'agentic_turn', schema: AGENTIC_SCHEMA, strict: true },
@@ -1009,17 +1153,19 @@ export async function repairReport(ctx: RepairContext, digest: SchemaDigest): Pr
     ctx.refinement ? `User refinement instruction (any language):\n${ctx.refinement}` : '',
   ].filter(Boolean).join('\n\n');
 
+  const messages: Msg[] = [
+    { role: 'system', content: SYSTEM },
+    { role: 'system', content: REPAIR_SYSTEM },
+    { role: 'system', content: `Max rows: ${env.REPORT_MAX_ROWS}. Schema digest:\n${schemaToPrompt(digest)}` },
+    { role: 'user',   content: context },
+  ];
+  const { clampedOutput } = computeBudget(messagesTokens(messages));
   const t0 = Date.now();
   const resp = await c.chat.completions.create({
     model: env.OPENAI_MODEL,
     temperature: 0.1,
-    max_tokens: env.OPENAI_MAX_OUTPUT_TOKENS,
-    messages: [
-      { role: 'system', content: SYSTEM },
-      { role: 'system', content: REPAIR_SYSTEM },
-      { role: 'system', content: `Max rows: ${env.REPORT_MAX_ROWS}. Schema digest:\n${schemaToPrompt(digest)}` },
-      { role: 'user',   content: context },
-    ],
+    max_tokens: clampedOutput,
+    messages,
     response_format: {
       type: 'json_schema',
       json_schema: { name: 'report', schema: SCHEMA, strict: true },

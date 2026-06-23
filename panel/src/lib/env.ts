@@ -55,6 +55,11 @@ export const env = {
   // and get truncated mid-JSON, which produces an unparseable body. gpt-4o /
   // gpt-4o-mini support up to 16384 output tokens; 8000 is a safe headroom.
   get OPENAI_MAX_OUTPUT_TOKENS() { return num('OPENAI_MAX_OUTPUT_TOKENS', 8000); },
+  // Total context window for the chosen model (input + output tokens). The
+  // request body is fitted under (CONTEXT_WINDOW - MAX_OUTPUT_TOKENS - margin)
+  // by trimming the previous-report echo and older history. gpt-4o / gpt-4o-mini
+  // / gpt-4.1 all expose 128k; raise this only for models with a larger window.
+  get OPENAI_CONTEXT_WINDOW() { return num('OPENAI_CONTEXT_WINDOW', 128000); },
   get OPENAI_USE_PROXY() { return opt('OPENAI_USE_PROXY', 'false') === 'true'; },
   get PROXY_TYPE() { return opt('PROXY_TYPE', 'socks5'); },
   get PROXY_HOST() { return opt('PROXY_HOST', '127.0.0.1'); },
