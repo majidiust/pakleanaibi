@@ -1,5 +1,5 @@
 'use client';
-import { createContext, useContext, useState, useMemo } from 'react';
+import { createContext, useContext, useEffect, useState, useMemo } from 'react';
 
 // Render-mode flag plumbed from DataTable (and similar containers) so cell
 // renderers can show fuller content when there's room. `full` is true when
@@ -77,7 +77,7 @@ export function CellValue({ v, depth = 0 }: { v: unknown; depth?: number }) {
     }
     case 'string': {
       const s = v as string;
-      if (s.length <= 80) return <span dir="auto" className="text-xs text-ink-2 whitespace-pre-wrap">{s}</span>;
+      if (s.length <= 80 || full) return <span dir="auto" className="text-xs text-ink-2 whitespace-pre-wrap">{s}</span>;
       return (
         <span dir="auto" className="text-xs text-ink-2 whitespace-pre-wrap">
           {expanded ? s : s.slice(0, 80) + '…'}
@@ -101,7 +101,11 @@ export function CellValue({ v, depth = 0 }: { v: unknown; depth?: number }) {
 }
 
 function ScalarArray({ items }: { items: unknown[] }) {
-  const [open, setOpen] = useState(false);
+  const { full } = useContext(CellRenderContext);
+  const [open, setOpen] = useState(full);
+  // Reset to the mode default when the surrounding table toggles fullscreen
+  // so collapsed cells expand on Expand and re-collapse on Close.
+  useEffect(() => { setOpen(full); }, [full]);
   const VIS = 8;
   const visible = open ? items : items.slice(0, VIS);
   const more = items.length - visible.length;
@@ -120,7 +124,9 @@ function ScalarArray({ items }: { items: unknown[] }) {
 }
 
 function MixedArray({ items, depth }: { items: unknown[]; depth: number }) {
-  const [open, setOpen] = useState(depth < 1);
+  const { full } = useContext(CellRenderContext);
+  const [open, setOpen] = useState(depth < 1 || full);
+  useEffect(() => { setOpen(depth < 1 || full); }, [full, depth]);
   return (
     <div className="space-y-0.5">
       <button type="button" className="text-2xs link" onClick={() => setOpen(o => !o)}>
@@ -137,10 +143,13 @@ function MixedArray({ items, depth }: { items: unknown[]; depth: number }) {
 
 function ObjectView({ obj, depth }: { obj: Record<string, unknown>; depth: number }) {
   const entries = useMemo(() => Object.entries(obj).filter(([, val]) => val !== undefined), [obj]);
+  const { full } = useContext(CellRenderContext);
   // Auto-expand at the top level so the analyst doesn't have to click to see
   // a single-object cell; collapse by default once we're already inside a
-  // nested structure to keep the parent cell scannable.
-  const [open, setOpen] = useState(depth < 1);
+  // nested structure to keep the parent cell scannable. In fullscreen mode
+  // every nesting level expands by default — room is no longer scarce.
+  const [open, setOpen] = useState(depth < 1 || full);
+  useEffect(() => { setOpen(depth < 1 || full); }, [full, depth]);
   if (entries.length === 0) return <span className="text-muted-2 text-2xs">{`{ }`}</span>;
   return (
     <div className="space-y-0.5">
