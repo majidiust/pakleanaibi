@@ -179,20 +179,97 @@ function clausesContradict(a: { op: string; val: unknown }, b: { op: string; val
   return null;
 }
 
+// Detect whether a $-prefixed expression path's leaf segment looks like an
+// ObjectId-bearing field by Mongo convention. We accept _id exactly and the
+// classic camelCase foreign-key form *Id (userId, laundryId, customerId).
+// We deliberately do NOT match arbitrary "Id"-suffix words ("invalidId" off
+// a unrelated entity etc.) so the coercion stays conservative.
+function isObjectIdFieldPath(p: unknown): boolean {
+  if (typeof p !== 'string' || !p.startsWith('$') || p.startsWith('$$')) return false;
+  const segs = p.slice(1).split('.');
+  const last = segs[segs.length - 1];
+  return last === '_id' || /^[a-z][a-zA-Z0-9]*Id$/.test(last);
+}
+
+function isObjectIdHexLiteral(v: unknown): v is string {
+  return typeof v === 'string' && /^[0-9a-f]{24}$/i.test(v);
+}
+
+// Coerce raw 24-hex string literals that compare against an ObjectId field
+// path into the EJSON shorthand {"$oid":"..."}. The pipeline-guard decodes
+// that shorthand into a real BSON ObjectId before execution, so this rewrite
+// turns the always-false comparison ($eq[ObjectId, string]) into the
+// intended type-matched equality. Walks nested expressions ($cond, $switch,
+// $and, $or, ...) without changing structural shape.
+function coerceObjectIdEqualities(pipeline: Stage[]): { pipeline: Stage[]; count: number } {
+  let count = 0;
+  const wrap = (hex: string): Record<string, string> => ({ $oid: hex.toLowerCase() });
+  const walk = (node: unknown): unknown => {
+    if (Array.isArray(node)) return node.map(walk);
+    if (node === null || typeof node !== 'object') return node;
+    const obj = node as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if ((k === '$eq' || k === '$ne') && Array.isArray(v) && v.length === 2) {
+        const [a, b] = v;
+        if (isObjectIdFieldPath(a) && isObjectIdHexLiteral(b)) {
+          count += 1;
+          out[k] = [a, wrap(b)];
+          continue;
+        }
+        if (isObjectIdFieldPath(b) && isObjectIdHexLiteral(a)) {
+          count += 1;
+          out[k] = [wrap(a), b];
+          continue;
+        }
+      }
+      if ((k === '$in' || k === '$nin') && Array.isArray(v) && v.length === 2) {
+        const [a, b] = v;
+        if (isObjectIdFieldPath(a) && Array.isArray(b)) {
+          let changed = false;
+          const coerced = b.map(x => {
+            if (isObjectIdHexLiteral(x)) { changed = true; count += 1; return wrap(x); }
+            return walk(x);
+          });
+          if (changed) { out[k] = [a, coerced]; continue; }
+        }
+      }
+      out[k] = walk(v);
+    }
+    return out;
+  };
+  return { pipeline: pipeline.map(s => walk(s) as Stage), count };
+}
+
 export function checkLogicalConsistency(pipeline: Stage[]): LogicVerdict {
+  // 0) ObjectId-string equality coercion. The LLM repeatedly compares an
+  // _id field (BSON ObjectId) against a raw 24-hex string literal, which
+  // MongoDB evaluates as false for every row under type bracketing. We
+  // rewrite the literal to {"$oid":"..."} so the pipeline-guard converts
+  // it to a real ObjectId at lowering time. Runs FIRST so downstream rules
+  // see the corrected pipeline; the resulting warning is preserved even
+  // when a later autofix (e.g. $sort/$limit swap) fires on the same turn.
+  const coerced = coerceObjectIdEqualities(pipeline);
+  const work = coerced.count > 0 ? coerced.pipeline : pipeline;
+  const oidWarning = coerced.count > 0
+    ? `Coerced ${coerced.count} ObjectId comparison(s) from raw hex string to {"$oid": "..."} so the equality matches the BSON type.`
+    : null;
+
   // 1) $limit before $sort -> autofix swap. Most common LLM bug: the model
   // wants "top 10 by date" but writes [$limit, $sort] which limits to a
   // random sample then sorts the sample. Swap if and only if the two
   // stages are adjacent so we never alter the analyst's intent for a paged
   // pipeline like [$sort, $limit 10, $skip 10, $limit 10].
-  for (let i = 0; i < pipeline.length - 1; i += 1) {
-    if (stageOp(pipeline[i]) === '$limit' && stageOp(pipeline[i + 1]) === '$sort') {
-      const fixed = pipeline.slice();
+  for (let i = 0; i < work.length - 1; i += 1) {
+    if (stageOp(work[i]) === '$limit' && stageOp(work[i + 1]) === '$sort') {
+      const fixed = work.slice();
       [fixed[i], fixed[i + 1]] = [fixed[i + 1], fixed[i]];
       return {
         ok: false, mode: 'autofix', pipeline: fixed,
         rule: 'limit_before_sort',
-        warning: 'Reordered stages: $sort must run before $limit so the top-N comes from a sorted set rather than a random sample.',
+        warning: oidWarning
+          ? `${oidWarning} Also reordered stages: $sort must run before $limit so the top-N comes from a sorted set rather than a random sample.`
+          : 'Reordered stages: $sort must run before $limit so the top-N comes from a sorted set rather than a random sample.',
       };
     }
   }
@@ -202,8 +279,8 @@ export function checkLogicalConsistency(pipeline: Stage[]): LogicVerdict {
   // combinations ($eq=A then $eq=B; $gt=10 then $lt=5; etc.). These would
   // silently return zero rows.
   const matches: Array<{ idx: number; body: unknown }> = [];
-  for (let i = 0; i < pipeline.length; i += 1) {
-    if (stageOp(pipeline[i]) === '$match') matches.push({ idx: i, body: pipeline[i].$match });
+  for (let i = 0; i < work.length; i += 1) {
+    if (stageOp(work[i]) === '$match') matches.push({ idx: i, body: work[i].$match });
   }
   if (matches.length > 1) {
     const fields = new Set<string>();
@@ -237,8 +314,8 @@ export function checkLogicalConsistency(pipeline: Stage[]): LogicVerdict {
   // (e.g. after $replaceRoot) so we never raise on legitimately permissive
   // pipelines.
   let fs: FieldSet = { mode: 'unknown' };
-  for (let i = 0; i < pipeline.length; i += 1) {
-    const s = pipeline[i];
+  for (let i = 0; i < work.length; i += 1) {
+    const s = work[i];
     if (stageOp(s) === '$match' && fs.mode === 'known') {
       const known = fs.fields;
       const refs = matchFieldKeys(s.$match);
@@ -257,19 +334,31 @@ export function checkLogicalConsistency(pipeline: Stage[]): LogicVerdict {
 
   // 4) Redundant $sort immediately followed by $group that does not use
   // $first / $last (so the sort order is discarded). Drop the dead $sort.
-  for (let i = 0; i < pipeline.length - 1; i += 1) {
-    if (stageOp(pipeline[i]) !== '$sort' || stageOp(pipeline[i + 1]) !== '$group') continue;
-    const group = pipeline[i + 1].$group as Record<string, unknown>;
+  for (let i = 0; i < work.length - 1; i += 1) {
+    if (stageOp(work[i]) !== '$sort' || stageOp(work[i + 1]) !== '$group') continue;
+    const group = work[i + 1].$group as Record<string, unknown>;
     const usesOrdered = JSON.stringify(group).includes('"$first"') || JSON.stringify(group).includes('"$last"');
     if (usesOrdered) continue;
-    const fixed = pipeline.slice(0, i).concat(pipeline.slice(i + 1));
+    const fixed = work.slice(0, i).concat(work.slice(i + 1));
     return {
       ok: false, mode: 'autofix', pipeline: fixed,
       rule: 'dead_sort_before_group',
-      warning: 'Removed a $sort whose order was discarded by the following $group (no $first/$last used).',
+      warning: oidWarning
+        ? `${oidWarning} Also removed a $sort whose order was discarded by the following $group (no $first/$last used).`
+        : 'Removed a $sort whose order was discarded by the following $group (no $first/$last used).',
     };
   }
 
+  // No downstream rule fired. If the ObjectId coercion rewrote literals,
+  // surface it as a standalone autofix so the corrected pipeline reaches
+  // execution and the warning is recorded on the report.
+  if (oidWarning) {
+    return {
+      ok: false, mode: 'autofix', pipeline: work,
+      rule: 'objectid_string_coercion',
+      warning: oidWarning,
+    };
+  }
   return { ok: true };
 }
 
