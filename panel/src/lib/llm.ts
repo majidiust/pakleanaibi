@@ -70,10 +70,33 @@ function tryRepairTruncated(s: string): string | null {
   return head + tail;
 }
 
-class LlmJsonError extends Error {
+// Raised when the model's response can't be parsed as JSON (either malformed
+// from the start or truncated by the output-token cap). The route layer
+// detects this via `isLlmOutputError` and feeds it back into the self-repair
+// loop instead of bubbling the raw parser message to the user.
+export class LlmJsonError extends Error {
+  readonly code = 'llm_json' as const;
   constructor(msg: string, public readonly snippet: string, public readonly truncated: boolean) {
     super(msg);
   }
+}
+
+// Raised when the model's JSON parsed cleanly but the shape doesn't satisfy
+// the report contract (missing collection, pipeline of wrong type, embedded
+// pipeline string that doesn't decode to an array, ...). Same recovery
+// pathway as LlmJsonError.
+export class LlmShapeError extends Error {
+  readonly code = 'llm_shape' as const;
+  constructor(msg: string, public readonly detail: string) {
+    super(msg);
+  }
+}
+
+// True for any error that originated from the LLM output itself (vs a
+// transport / configuration / Mongo error). The agentic route uses this as
+// the signal to keep self-healing rather than abort the turn.
+export function isLlmOutputError(e: unknown): e is LlmJsonError | LlmShapeError {
+  return e instanceof LlmJsonError || e instanceof LlmShapeError;
 }
 
 // ----- Token budget helpers -------------------------------------------------
@@ -240,12 +263,23 @@ function decodeReport(raw: unknown, opName: string): LlmReport {
     try { inner = JSON.parse(o.pipeline); }
     catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      throw new Error(`${opName}: pipeline string is not valid JSON: ${msg}`);
+      throw new LlmShapeError(
+        `${opName}: pipeline string is not valid JSON`,
+        `${msg} (raw length=${o.pipeline.length})`,
+      );
     }
-    if (!Array.isArray(inner)) throw new Error(`${opName}: pipeline JSON decoded to ${typeof inner}, expected array`);
+    if (!Array.isArray(inner)) {
+      throw new LlmShapeError(
+        `${opName}: pipeline JSON decoded to ${typeof inner}, expected array`,
+        `decoded typeof=${typeof inner}`,
+      );
+    }
     pipeline = inner as Record<string, unknown>[];
   } else {
-    throw new Error(`${opName}: pipeline is missing or wrong type (${typeof o.pipeline})`);
+    throw new LlmShapeError(
+      `${opName}: pipeline is missing or wrong type`,
+      `typeof pipeline=${typeof o.pipeline}`,
+    );
   }
   const display = (o.display ?? {}) as Record<string, unknown>;
   const cleanStr = (v: unknown): string | undefined =>
@@ -1211,7 +1245,12 @@ export async function agenticReport(ctx: AgenticContext, digest: SchemaDigest): 
       );
     } else throw e;
   }
-  if (out.kind === 'report' && !out.report) throw new Error('LLM returned kind=report without a report object');
+  if (out.kind === 'report' && !out.report) {
+    throw new LlmShapeError(
+      'report.agentic: LLM returned kind=report without a report object',
+      'kind=report but report=null',
+    );
+  }
   return out;
 }
 

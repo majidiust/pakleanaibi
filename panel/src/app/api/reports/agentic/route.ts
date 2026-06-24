@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { Db, ObjectId } from 'mongodb';
 import { requireRole } from '@/lib/auth';
 import { getSchema, type SchemaDigest } from '@/lib/schema';
-import { agenticReport, type ChatMessage, type LlmReport, type AgenticTurn } from '@/lib/llm';
+import { agenticReport, isLlmOutputError, type ChatMessage, type LlmReport, type AgenticTurn } from '@/lib/llm';
 import { validatePipeline, lowerPipeline } from '@/lib/pipeline-guard';
 import { dataDb, biDb, getServerInfo } from '@/lib/mongo';
 import { env } from '@/lib/env';
@@ -376,30 +376,126 @@ function enrichError(raw: string, broken: LlmReport): string {
   return `${raw}\n\nAGENT HINTS:\n- ${hints.join('\n- ')}`;
 }
 
+// Discriminated union the route uses to decide what to do next.
+// - 'ok': the LLM returned a parseable, well-shaped turn.
+// - 'malformed_output': the LLM emitted JSON we can't decode or whose shape
+//   doesn't satisfy the report contract. RECOVERABLE \u2014 the route feeds a
+//   strict-reformat instruction into the next pendingError and tries again.
+// - 'transport': anything else (network, auth, schema-build, mongo digest
+//   fetch). The route treats this as recoverable too \u2014 it surfaces a
+//   conversational fallback instead of HTTP 5xx.
+type AgentResult =
+  | { status: 'ok'; turn: AgenticTurn }
+  | { status: 'malformed_output'; detail: string }
+  | { status: 'transport'; detail: string };
 async function callAgent(
   history: ChatMessage[], lastReport: LlmReport | null, pendingError: string | null,
   digest: SchemaDigest, serverVersion: { major: number; minor: number; raw: string },
-): Promise<AgenticTurn | { error: string }> {
-  try { return await agenticReport({ history, lastReport, pendingError, serverVersion }, digest); }
-  catch (e) { return { error: e instanceof Error ? e.message : String(e) }; }
+  reqId: string,
+): Promise<AgentResult> {
+  try {
+    const turn = await agenticReport({ history, lastReport, pendingError, serverVersion }, digest);
+    return { status: 'ok', turn };
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    if (isLlmOutputError(e)) {
+      console.warn(`[agentic ${reqId}] malformed LLM output:`, detail, e instanceof Error && 'snippet' in e ? (e as { snippet?: string }).snippet : undefined);
+      return { status: 'malformed_output', detail };
+    }
+    console.warn(`[agentic ${reqId}] transport / config failure:`, detail);
+    return { status: 'transport', detail };
+  }
+}
+
+// Internal instruction we feed back to the model when its OWN output failed
+// to decode. This is never shown to the user; it lives only inside the next
+// pendingError sent to the LLM.
+function strictReformatInstruction(detail: string): string {
+  return [
+    'Your previous response could not be parsed by the server.',
+    'Internal decode detail (do NOT echo to the user): ' + detail,
+    'Re-emit a SINGLE strict JSON object that satisfies the response schema:',
+    '  - kind is "question" or "report"',
+    '  - message is a short plain-language string for the user',
+    '  - when kind="report", the embedded pipeline field MUST be a JSON-encoded string of an ARRAY of stage objects (e.g. "[{\\"$match\\":...}]"). Every key and string MUST be double-quoted. No trailing commas. No comments. No ellipses. No control characters inside string literals.',
+    '  - Keep the pipeline focused and short. If the previous output was likely truncated, drop optional fields (warnings, unused $project keys) to stay under the output cap.',
+  ].join('\n');
+}
+
+// Detect whether the most recent user turn was written in Persian/Farsi so
+// the conversational fallback message lands in the right language. We rely
+// on Unicode block U+0600-06FF which covers Arabic/Persian script.
+function userLanguage(history: ChatMessage[]): 'fa' | 'en' {
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].role === 'user') {
+      // eslint-disable-next-line no-misleading-character-class
+      return /[\u0600-\u06FF]/.test(history[i].content) ? 'fa' : 'en';
+    }
+  }
+  return 'en';
+}
+
+// Conversational fallback messages used when self-healing has exhausted its
+// budget. The user never sees a stack trace or parser error; they see a
+// short, collaborative prompt that invites them to refine the request.
+type FallbackKind = 'malformed_output' | 'transport' | 'mongo_unrecoverable' | 'verification_unrecoverable';
+function fallbackMessage(kind: FallbackKind, lang: 'fa' | 'en'): string {
+  if (lang === 'fa') {
+    switch (kind) {
+      case 'malformed_output':
+        return 'یک لحظه گیر کردم و نتوانستم پاسخ قبلی را کامل بسازم. می‌توانیم تغییر آخر را کمی ساده‌تر یا قدم‌به‌قدم بگوییم؟ یا اگر مایلید، به نسخهٔ قبلی برمی‌گردیم و از آنجا ادامه می‌دهیم.';
+      case 'transport':
+        return 'فعلاً نمی‌توانم به سرویس فکر متصل بمانم. لطفاً همان درخواست را یک‌بار دیگر بفرستید؛ اگر باز هم نشد، بفرمایید چه چیزی را می‌خواهید ببینید تا با مسیر دیگری امتحان کنم.';
+      case 'mongo_unrecoverable':
+        return 'بعد از چند تلاش هنوز نتوانستم این درخواست را اجرا کنم. می‌توانیم: ۱) فیلد یا فیلتر مشخصی که مدنظرتان است را تأیید کنیم، ۲) به نسخهٔ قبلی همین گفت‌وگو برگردیم، یا ۳) درخواست را به بخش‌های کوچک‌تر بشکنیم. کدام را ترجیح می‌دهید؟';
+      case 'verification_unrecoverable':
+        return 'نتیجه‌ای که آماده شد به نظر کامل نمی‌رسد و نمی‌خواهم چیز اشتباهی نشان دهم. لطفاً بفرمایید کدام ستون‌ها برایتان مهم‌تر است یا اگر مایلید نسخهٔ قبلی را بازیابی کنیم.';
+    }
+  }
+  switch (kind) {
+    case 'malformed_output':
+      return 'I lost the thread while finalizing that change. Could we tackle the last step more simply — for example one tweak at a time — or would you like me to roll back to the previous version and try a different path?';
+    case 'transport':
+      return 'I temporarily can\'t reach my reasoning service. Please resend the same request; if it still doesn\'t go through, tell me what you need to see and I\'ll try a different approach.';
+    case 'mongo_unrecoverable':
+      return 'After a few tries I still couldn\'t run that query cleanly. We can: (1) confirm the exact field or filter you have in mind, (2) restore the previous version and continue from there, or (3) break the request into smaller steps. Which would you prefer?';
+    case 'verification_unrecoverable':
+      return 'The result didn\'t look complete enough to show \u2014 I\'d rather not display something misleading. Could you tell me which columns matter most, or shall I restore the previous version?';
+  }
+}
+
+// User-facing label for an execution that failed under the hood. We never
+// echo the raw Mongo / driver message: it's noise for the analyst and a
+// liability for the assistant persona. The detailed text stays in server
+// logs and in the persisted ConversationVersion (developer artifact).
+function publicExecutionLabel(_raw: string | undefined, lang: 'fa' | 'en'): string {
+  return lang === 'fa' ? 'این مرحله نیاز به اصلاح داشت' : 'Needed an adjustment';
 }
 
 export async function POST(req: Request) {
   let me; try { me = await requireRole('admin', 'analyst'); } catch (r) { return r as Response; }
-  // Wrap the rest of the handler so any uncaught exception (LLM config
-  // error, mongo connection failure, schema-load crash, ...) becomes a
-  // structured JSON response. The agentic client parses every response
-  // as JSON, so an HTML 500 page bubbles up as a cryptic "Unexpected
-  // token '<'" error and the user can't recover.
+  // The agentic handler is recovery-first: any path that previously could
+  // throw a raw exception now lands on a conversational kind:'question'
+  // turn. This wrapper is a final safety net for the truly unexpected
+  // (handler crash before it builds a response) \u2014 we still hand back a
+  // friendly turn instead of HTTP 5xx with a stack trace, and log the raw
+  // detail to the server console for developer observability.
+  const reqId = new ObjectId().toHexString().slice(-8);
   try {
-    return await handleAgenticPost(req, me.sub);
+    return await handleAgenticPost(req, me.sub, reqId);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
+    const detail = e instanceof Error ? e.message : String(e);
+    console.error(`[agentic ${reqId}] uncaught handler failure:`, detail, e instanceof Error ? e.stack : undefined);
+    // Best-effort language detection from the body we already consumed isn't
+    // possible here (the request body was consumed inside handleAgenticPost).
+    // Default to English; the conversational turn is generic enough that an
+    // analyst can recover from either side.
     return NextResponse.json({
-      error: 'internal',
-      message: 'Agentic turn failed unexpectedly. Try again, or rephrase the question. ' +
-        '(Server detail: ' + msg.slice(0, 300) + ')',
-    }, { status: 500 });
+      kind: 'question',
+      message: fallbackMessage('transport', 'en'),
+      needs: null,
+      repairs: [],
+    });
   }
 }
 
@@ -465,17 +561,29 @@ async function appendConversationVersion(
   }
 }
 
-async function handleAgenticPost(req: Request, userId: string): Promise<Response> {
-  const parsed = Body.safeParse(await req.json().catch(() => null));
+async function handleAgenticPost(req: Request, userId: string, reqId: string): Promise<Response> {
+  const body = await req.json().catch(() => null);
+  const parsed = Body.safeParse(body);
   if (!parsed.success) {
-    // Surface the first failing path so the client can show a useful hint
-    // instead of an opaque "invalid_body".
-    const issue = parsed.error.issues[0];
+    // A body validation failure is almost always a client bug, not a user
+    // mistake. We log the detail for developers and respond with the same
+    // conversational fallback as any other unrecoverable internal issue so
+    // the user is not exposed to zod messages or path traversal noise.
+    console.warn(`[agentic ${reqId}] invalid request body:`, parsed.error.issues.slice(0, 5));
+    // Heuristic language: try to read history from the raw body even though
+    // it failed validation; default to English on failure.
+    const probe: ChatMessage[] = Array.isArray((body as { history?: unknown })?.history)
+      ? ((body as { history: unknown[] }).history.filter(
+          (m): m is ChatMessage => !!m && typeof m === 'object'
+            && typeof (m as { content?: unknown }).content === 'string',
+        ))
+      : [];
     return NextResponse.json({
-      error: 'invalid_body',
-      message: issue ? `${issue.path.join('.')}: ${issue.message}` : 'request payload failed validation',
-      issues: parsed.error.issues.slice(0, 5),
-    }, { status: 400 });
+      kind: 'question',
+      message: fallbackMessage('transport', userLanguage(probe)),
+      needs: null,
+      repairs: [],
+    });
   }
 
   const { history, lastReport, execute = true, maxRepairs = 2, conversationId } = parsed.data;
@@ -485,11 +593,15 @@ async function handleAgenticPost(req: Request, userId: string): Promise<Response
   // user turn to act on, otherwise there's nothing to answer.
   const cleaned = history.filter(m => m.content.trim().length > 0);
   if (cleaned.length === 0 || !cleaned.some(m => m.role === 'user')) {
+    console.warn(`[agentic ${reqId}] empty history after cleaning`);
     return NextResponse.json({
-      error: 'invalid_body',
-      message: 'history must contain at least one non-empty user message',
-    }, { status: 400 });
+      kind: 'question',
+      message: fallbackMessage('transport', userLanguage(history as ChatMessage[])),
+      needs: null,
+      repairs: [],
+    });
   }
+  const lang = userLanguage(cleaned as ChatMessage[]);
   const [digest, serverInfo] = await Promise.all([getSchema(false), getServerInfo()]);
   const version: [number, number] = [serverInfo.major, serverInfo.minor];
   // Sliding window: drop everything but the most recent N turns. The LLM
@@ -499,30 +611,74 @@ async function handleAgenticPost(req: Request, userId: string): Promise<Response
   const history2: ChatMessage[] = trimmed.map(m => ({ role: m.role, content: m.content }));
   const db = await dataDb();
 
-  // --- Initial turn ---------------------------------------------------------
-  const first = await callAgent(history2, lastReport ?? null, null, digest, serverInfo);
-  if ('error' in first) {
-    return NextResponse.json({ error: 'llm_failed', message: first.error }, { status: 502 });
+  // Generation budget: every LLM call \u2014 initial OR repair OR strict-reformat
+  // retry \u2014 draws from this shared counter so a chatty model can't burn the
+  // budget on malformed-output retries alone. maxRepairs+1 keeps the same
+  // total spend as before (1 initial + N repairs), but now any of those
+  // slots can be consumed by an output-shape retry instead.
+  let llmBudget = maxRepairs + 1;
+  const callWithBudget = async (
+    h: ChatMessage[], lastR: LlmReport | null, pendingError: string | null,
+  ): Promise<AgentResult> => {
+    if (llmBudget <= 0) return { status: 'transport', detail: 'llm_budget_exhausted' };
+    llmBudget -= 1;
+    return callAgent(h, lastR, pendingError, digest, serverInfo, reqId);
+  };
+
+  // --- Initial turn with strict-reformat self-healing ----------------------
+  // If the model returns malformed JSON / wrong shape, we re-ask up to the
+  // remaining budget with an internal "re-emit strict JSON" instruction.
+  // The retries never reach the user.
+  let firstTurn: AgenticTurn | null = null;
+  let firstFailure: AgentResult | null = null;
+  {
+    let pending: string | null = null;
+    while (firstTurn === null) {
+      const r = await callWithBudget(history2, lastReport ?? null, pending);
+      if (r.status === 'ok') { firstTurn = r.turn; break; }
+      if (r.status === 'malformed_output' && llmBudget > 0) {
+        pending = strictReformatInstruction(r.detail);
+        continue;
+      }
+      firstFailure = r;
+      break;
+    }
   }
-  const firstNormalized = normalizeReport(first);
-  if (!firstNormalized) {
+  if (!firstTurn) {
+    // Self-healing exhausted on the very first turn \u2014 convert to a friendly
+    // question so the analyst can rephrase or simplify.
+    const kind: FallbackKind = firstFailure?.status === 'transport' ? 'transport' : 'malformed_output';
     return NextResponse.json({
       kind: 'question',
-      message: first.message || 'Could you tell me which collection and time range you have in mind?',
-      // Forward the structured "needs" hint so the client can render
-      // an inline picker (e.g. Jalali date picker) for date questions.
-      needs: first.needs ?? null,
+      message: fallbackMessage(kind, lang),
+      needs: null,
+      repairs: [],
+    });
+  }
+  const firstNormalized = normalizeReport(firstTurn);
+  if (!firstNormalized) {
+    // The agent itself elected to ask a clarifying question \u2014 this is the
+    // intended conversational path, not a failure. Pass the message through.
+    return NextResponse.json({
+      kind: 'question',
+      message: firstTurn.message || (lang === 'fa'
+        ? 'برای ادامه چند اطلاع بیشتر لازم دارم — مجموعه و بازهٔ زمانی مدنظر شما کدام است؟'
+        : 'I need a little more detail to continue — which collection and time range did you have in mind?'),
+      needs: firstTurn.needs ?? null,
     });
   }
   if (!execute) {
-    return NextResponse.json({ kind: 'report', message: first.message, report: firstNormalized, execution: null, repairs: [] });
+    return NextResponse.json({ kind: 'report', message: firstTurn.message, report: firstNormalized, execution: null, repairs: [] });
   }
 
   const initial = await runReport(db, firstNormalized, version);
+  if (!initial.execution.ok) {
+    console.warn(`[agentic ${reqId}] initial execution failed:`, initial.execution.error);
+  }
   const initialVerdict = verifyResult(initial.sealed, initial.execution);
   const attempts: Attempt[] = [{
     source: 'initial',
-    message: first.message,
+    message: firstTurn.message,
     report: initial.sealed,
     execution: initial.execution,
     verification: initialVerdict.ok ? undefined : initialVerdict,
@@ -531,40 +687,46 @@ async function handleAgenticPost(req: Request, userId: string): Promise<Response
   // --- Self-repair loop -----------------------------------------------------
   // Trigger the repair turn when EITHER the driver rejected the pipeline
   // (execution.ok=false) OR the verification layer flagged a semantically
-  // bogus result (missing projected columns, all-null computed columns,
-  // EJSON wrappers leaking into output). Bounded by maxRepairs so we
-  // never spin; verification failures consume the same budget as Mongo
-  // failures by design.
+  // bogus result. The same budget covers malformed-output retries during
+  // repair, so a chronic JSON-shape regression can't starve actual fixes.
   let current = attempts[0];
   const needsRepair = (a: Attempt) => !a.execution.ok || (a.verification !== undefined && !a.verification.ok);
-  for (let i = 0; i < maxRepairs && needsRepair(current); i++) {
-    // Choose the most actionable pendingError: a Mongo error is always
-    // more specific than a verification verdict, so prefer that when
-    // both could apply (though they're mutually exclusive in practice
-    // because verification only runs on execution.ok=true).
+  while (needsRepair(current) && llmBudget > 0) {
     const pendingError = !current.execution.ok
       ? enrichError(current.execution.error ?? 'unknown_error', current.report)
       : (current.verification && !current.verification.ok ? current.verification.issue : 'unknown_error');
-    const next = await callAgent(history2, current.report, pendingError, digest, serverInfo);
-    if ('error' in next) {
-      break;
+    let next = await callWithBudget(history2, current.report, pendingError);
+    if (next.status === 'malformed_output') {
+      // Try one more time with a strict-reformat instruction stacked on top
+      // of the pending error so we keep the diagnostic context.
+      if (llmBudget <= 0) break;
+      next = await callWithBudget(
+        history2, current.report,
+        pendingError + '\n\n' + strictReformatInstruction(next.detail),
+      );
     }
-    const norm = normalizeReport(next);
+    if (next.status !== 'ok') break;
+    const norm = normalizeReport(next.turn);
     if (!norm) {
-      // The agent gave up on a fix and asked a clarifying question — stop
-      // and surface that as the final turn instead of the broken report.
+      // The agent decided to ask a clarifying question instead of fixing.
+      // That's a perfectly valid recovery path \u2014 hand it to the user.
       return NextResponse.json({
         kind: 'question',
-        message: next.message || 'I need more information to fix this query.',
-        needs: next.needs ?? null,
-        repairs: attempts.slice(1),
+        message: next.turn.message || (lang === 'fa'
+          ? 'برای اصلاح این درخواست به یک نکتهٔ بیشتر نیاز دارم \u2014 می‌توانید کمی توضیح دهید؟'
+          : 'I need one more detail to refine this \u2014 could you clarify?'),
+        needs: next.turn.needs ?? null,
+        repairs: sanitiseRepairs(attempts.slice(1), lang),
       });
     }
     const ran = await runReport(db, norm, version);
+    if (!ran.execution.ok) {
+      console.warn(`[agentic ${reqId}] repair execution failed:`, ran.execution.error);
+    }
     const verdict = verifyResult(ran.sealed, ran.execution);
     current = {
       source: 'repair',
-      message: next.message,
+      message: next.turn.message,
       report: ran.sealed,
       execution: ran.execution,
       verification: verdict.ok ? undefined : verdict,
@@ -574,31 +736,35 @@ async function handleAgenticPost(req: Request, userId: string): Promise<Response
   }
 
   const final = attempts[attempts.length - 1];
-  // If verification still flags the final attempt after the repair budget
-  // is exhausted, append a clear warning to the report so the analyst
-  // knows the result is suspect and the displayed table may be missing
-  // columns or contain bogus null values. We surface this both inside
-  // report.warnings (which the table header chip already renders) and as
-  // a top-level verification.issue so client-side panels can highlight
-  // it more prominently.
-  const finalVerdict: Verdict | undefined = final.verification;
-  let finalReport = final.report;
-  if (finalVerdict && !finalVerdict.ok) {
-    const existing = Array.isArray(final.report.warnings) ? final.report.warnings : [];
-    finalReport = {
-      ...final.report,
-      warnings: [
-        ...existing,
-        'Self-verification flagged this result as suspect after exhausting the repair budget. ' +
-        'Inspect carefully: ' + finalVerdict.issue.split('\n')[0],
-      ],
-    };
+  // --- Unrecoverable outcomes \u2192 conversational fallback ------------------
+  // If the repair budget is gone and the final attempt still has either a
+  // Mongo failure or a flagged verification issue, we do NOT ship a broken
+  // report to the user. Instead we return a kind:'question' turn with a
+  // friendly recovery prompt. The analyst can rephrase, restore an earlier
+  // version, or simplify the request \u2014 always staying inside the chat.
+  if (!final.execution.ok) {
+    return NextResponse.json({
+      kind: 'question',
+      message: fallbackMessage('mongo_unrecoverable', lang),
+      needs: null,
+      repairs: sanitiseRepairs(attempts.slice(1), lang),
+    });
   }
+  const finalVerdict: Verdict | undefined = final.verification;
+  if (finalVerdict && !finalVerdict.ok) {
+    return NextResponse.json({
+      kind: 'question',
+      message: fallbackMessage('verification_unrecoverable', lang),
+      needs: null,
+      repairs: sanitiseRepairs(attempts.slice(1), lang),
+    });
+  }
+
+  const finalReport = final.report;
   // Persist a version snapshot when this turn produced a report and the
-  // client supplied a conversation id. The snapshot captures the final
-  // pipeline (post-guard, post-lower) plus execution + verification stats
-  // so the analyst can browse / diff / restore prior queries within the
-  // same conversation. Best-effort \u2014 a Mongo blip never fails the turn.
+  // client supplied a conversation id. Best-effort \u2014 a Mongo blip never
+  // fails the turn. The persisted snapshot is a developer-visible artifact
+  // and may include the raw execution.error string for debugging.
   let savedVersion: ConversationVersion | null = null;
   if (conversationId && execute) {
     const lastUserMsg = [...trimmed].reverse().find(m => m.role === 'user')?.content ?? '';
@@ -618,7 +784,10 @@ async function handleAgenticPost(req: Request, userId: string): Promise<Response
         truncated: final.execution.truncated,
         error: final.execution.error,
       },
-      verification: finalVerdict && !finalVerdict.ok ? { ok: false, issue: finalVerdict.issue } : undefined,
+      // Reached this branch only when the verifier was happy with the result
+      // (the !ok case returns a kind:'question' turn higher up). No issue
+      // field to record.
+      verification: undefined,
       triggerMessage: lastUserMsg.slice(0, 200),
       repairCount: Math.max(0, attempts.length - 1),
     };
@@ -630,16 +799,35 @@ async function handleAgenticPost(req: Request, userId: string): Promise<Response
     message: final.message,
     report: finalReport,
     execution: final.execution,
-    verification: finalVerdict && !finalVerdict.ok ? { ok: false, issue: finalVerdict.issue } : { ok: true },
-    // Echo the freshly-saved version (if any) so the client can append it
-    // to its local versions list without a follow-up GET round-trip.
+    verification: { ok: true },
     savedVersion,
-    // Repair attempts in chronological order, excluding the initial turn.
-    repairs: attempts.slice(1).map(a => ({
-      message: a.message,
-      report: a.report,
-      execution: a.execution,
-      verification: a.verification ?? { ok: true },
-    })),
+    repairs: sanitiseRepairs(attempts.slice(1), lang),
   });
+}
+
+// Strip raw Mongo / driver error strings from the repair history we hand
+// back to the client. The user-facing UI renders these as chat bubbles, so
+// any technical text here ends up in the conversation. We keep the report
+// (so analysts can inspect intermediate pipelines via the versions panel)
+// and the per-attempt success flag, but replace the error string with a
+// short, non-technical phrase. Raw text lives only in server logs and in
+// the persisted ConversationVersion document.
+function sanitiseRepairs(attempts: Attempt[], lang: 'fa' | 'en'): Array<{
+  message: string;
+  report: LlmReport;
+  execution: { ok: boolean; count?: number; took?: number; truncated?: boolean; error?: string };
+  verification: Verdict;
+}> {
+  return attempts.map(a => ({
+    message: a.message,
+    report: a.report,
+    execution: {
+      ok: a.execution.ok,
+      count: a.execution.count,
+      took: a.execution.took,
+      truncated: a.execution.truncated,
+      error: a.execution.ok ? undefined : publicExecutionLabel(a.execution.error, lang),
+    },
+    verification: a.verification ?? { ok: true },
+  }));
 }

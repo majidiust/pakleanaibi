@@ -101,6 +101,12 @@ export function AgenticClient({ user }: { user: ExportUser }) {
     const trimmed = text.trim();
     if (!trimmed || busy) return;
     setErr(null);
+    // eslint-disable-next-line no-misleading-character-class
+    const isFa = /[\u0600-\u06FF]/.test(trimmed);
+    const lastUserLang = (): 'fa' | 'en' => isFa ? 'fa' : 'en';
+    const friendlyTransport = () => isFa
+      ? 'لحظه‌ای ارتباط با سرویس فکر برقرار نشد. لطفاً همان درخواست را دوباره بفرستید؛ اگر باز هم تکرار شد، بفرمایید چه نتیجه‌ای می‌خواهید ببینید.'
+      : 'I couldn\'t reach my reasoning service for a moment. Please resend the same request; if it still doesn\'t go through, tell me what you\'d like to see and I\'ll try a different path.';
     // If the analyst attached schema fields via the "+ Field" picker,
     // append them as an explicit hint block. The LLM already sees the
     // full schema digest, but having the user signal exactly which
@@ -173,12 +179,22 @@ export function AgenticClient({ user }: { user: ExportUser }) {
       let j: TurnResponse & { error?: string; message?: string } = {} as TurnResponse;
       try { j = JSON.parse(raw); }
       catch {
+        // The server is supposed to always return JSON; if it didn't (proxy
+        // page, auth bounce, route crash) we keep the raw snippet in the
+        // browser console for diagnosis and surface a conversational notice
+        // to the user instead of dumping HTML/text into the chat.
         const snippet = raw.replace(/\s+/g, ' ').trim().slice(0, 160);
-        setErr(`Server returned a non-JSON response (HTTP ${r.status}). ${snippet ? 'Body: ' + snippet : ''}`.trim());
+        console.warn('[agentic] non-JSON response', { status: r.status, snippet });
+        setErr(friendlyTransport());
         setBusy(null);
         return;
       }
-      if (!r.ok) { setErr(j.message ?? j.error ?? `request failed (HTTP ${r.status})`); setBusy(null); return; }
+      if (!r.ok) {
+        console.warn('[agentic] non-2xx response', { status: r.status, body: j });
+        setErr(friendlyTransport());
+        setBusy(null);
+        return;
+      }
       // Build the post-turn chat: the initial assistant turn, then one
       // bubble per auto-repair attempt so the user can follow what the
       // agent did to recover from each execution failure. Always store
@@ -196,10 +212,14 @@ export function AgenticClient({ user }: { user: ExportUser }) {
         ...(j.kind === 'question' && j.needs ? { needs: j.needs } : {}),
       }];
       for (const rep of j.repairs ?? []) {
+        // Repair bubbles show only the assistant's own short status text; we
+        // deliberately do NOT append raw Mongo error strings here. The server
+        // already replaced execution.error with a short non-technical label
+        // for the failure case, and a ✓ row-count is enough on success.
         const verdict = rep.execution.ok
           ? ` ✓ (${rep.execution.count ?? rep.execution.rows?.length ?? 0} rows)`
-          : ` ✗ (${rep.execution.error ?? 'failed'})`;
-        const repMsg = (rep.message?.trim() || rep.report?.explanation?.trim() || '(repair attempt)');
+          : '';
+        const repMsg = (rep.message?.trim() || rep.report?.explanation?.trim() || (lastUserLang() === 'fa' ? 'در حال اصلاح…' : 'Refining…'));
         appended.push({ role: 'assistant', content: repMsg + verdict, kind: 'repair' });
       }
       setHistory(h => [...h, ...appended]);
@@ -213,7 +233,11 @@ export function AgenticClient({ user }: { user: ExportUser }) {
         }
       }
     } catch (e) {
-      setErr(e instanceof Error ? e.message : 'request failed');
+      // Network-level failure (DNS, offline, fetch abort). Keep the raw
+      // detail in the console for developers; the user sees the same
+      // friendly notice as any other transport hiccup.
+      console.warn('[agentic] fetch failed', e);
+      setErr(friendlyTransport());
     } finally { setBusy(null); }
   }, [history, report, busy, attached, conversationId]);
 
@@ -298,7 +322,11 @@ export function AgenticClient({ user }: { user: ExportUser }) {
     setErr(null);
     try {
       const r = await fetch(`/api/agentic/conversations/${id}`);
-      if (!r.ok) { setErr('Failed to load conversation'); return; }
+      if (!r.ok) {
+        console.warn('[agentic] load conversation non-2xx', r.status);
+        setErr('I couldn\u2019t load that conversation. Please try again in a moment.');
+        return;
+      }
       const j = await r.json() as {
         id: string; history: ChatMsg[]; lastReport: LlmReport | null;
         versions?: ConversationVersion[];
@@ -313,7 +341,8 @@ export function AgenticClient({ user }: { user: ExportUser }) {
       // the freshly-loaded payload back to the server.
       lastSavedRef.current = JSON.stringify({ history: j.history ?? [], lastReport: j.lastReport ?? null });
     } catch (e) {
-      setErr(e instanceof Error ? e.message : 'failed to load');
+      console.warn('[agentic] load conversation failed', e);
+      setErr('I couldn\u2019t reach the server to load that conversation. Please try again.');
     }
   }, []);
 
@@ -328,14 +357,18 @@ export function AgenticClient({ user }: { user: ExportUser }) {
       let j: { rows?: Record<string, unknown>[]; took?: number; count?: number; truncated?: boolean; error?: string; message?: string } = {};
       try { j = await r.json(); } catch { /* non-JSON response */ }
       if (!r.ok) {
+        // Keep the raw server reason in the execution object so the
+        // recovery card can detect failure, but do NOT bleed it into the
+        // top-of-page notice. Developers can read the original message in
+        // the browser console.
+        console.warn('[agentic] execute non-2xx', r.status, j);
         setExecution({ ok: false, error: j.message ?? j.error ?? `HTTP ${r.status}` });
         return;
       }
       setExecution({ ok: true, rows: j.rows ?? [], took: j.took, count: j.count ?? (j.rows?.length ?? 0), truncated: j.truncated });
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setExecution({ ok: false, error: 'request_failed: ' + msg });
-      setErr('Execute failed: ' + msg);
+      console.warn('[agentic] execute failed', e);
+      setExecution({ ok: false, error: e instanceof Error ? e.message : String(e) });
     } finally { setBusy(null); }
   }, [report, busy]);
 
@@ -418,7 +451,12 @@ export function AgenticClient({ user }: { user: ExportUser }) {
         </div>
       </div>
 
-      {err && <div className="card card-pad text-err text-sm whitespace-pre-wrap">{err}</div>}
+      {err && (
+        <div className="card card-pad border-warn/30 bg-warn/5 text-sm whitespace-pre-wrap flex items-start justify-between gap-3">
+          <div className="text-ink-2 leading-relaxed min-w-0">{err}</div>
+          <button className="btn-subtle btn-sm shrink-0" onClick={() => setErr(null)} aria-label="Dismiss">✕</button>
+        </div>
+      )}
       {savedNotice && (
         <div className="card card-pad text-sm flex items-center justify-between gap-3">
           <span className="text-ok">✓ {savedNotice}</span>
@@ -434,6 +472,9 @@ export function AgenticClient({ user }: { user: ExportUser }) {
           canSave={report !== null && (execution?.ok ?? false)}
           versions={versions}
           onRestoreVersion={restoreVersion}
+          lastUserPrompt={lastUserPrompt}
+          onRetry={() => { if (lastUserPrompt) sendTurn(lastUserPrompt); }}
+          onRephrase={() => { if (lastUserPrompt) setInput(lastUserPrompt); }}
         />
         <ChatPanel
           history={history} input={input} busy={busy} chatRef={chatRef}
@@ -461,13 +502,16 @@ export function AgenticClient({ user }: { user: ExportUser }) {
   );
 }
 
-function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, canSave, versions, onRestoreVersion }: {
+function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, canSave, versions, onRestoreVersion, lastUserPrompt, onRetry, onRephrase }: {
   report: LlmReport | null; execution: Execution | null;
   busy: 'turn' | 'exec' | null; onExecute: () => void;
   onSaveAsTemplate: () => void;
   canSave: boolean;
   versions: ConversationVersion[];
   onRestoreVersion: (v: ConversationVersion) => void;
+  lastUserPrompt: string | undefined;
+  onRetry: () => void;
+  onRephrase: () => void;
 }) {
   if (!report) {
     return (
@@ -526,12 +570,49 @@ function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, can
         </details>
       </div>
 
-      {execution && !execution.ok && execution.error && (
-        <div className="card card-pad border-err/40">
-          <div className="label mb-1 text-err">MongoDB error</div>
-          <pre className="text-xs text-err whitespace-pre-wrap font-mono">{execution.error}</pre>
-        </div>
-      )}
+      {execution && !execution.ok && (() => {
+        // Conversational recovery card. We deliberately do NOT render
+        // execution.error verbatim — the agentic route already sanitises
+        // its own attempts to a friendly label and the manual-execute path
+        // (▶ Execute button) returns short transport-style messages. Raw
+        // detail still lives on the response object for diagnostics; we
+        // log it once to the console for developers.
+        // eslint-disable-next-line no-misleading-character-class
+        const isFa = /[\u0600-\u06FF]/.test((lastUserPrompt ?? '') + report.explanation);
+        if (execution.error) console.warn('[agentic] execution failed', execution.error);
+        return (
+          <div className="card card-pad border-warn/30 bg-warn/5">
+            <div className="flex items-start justify-between gap-3 flex-wrap">
+              <div className="space-y-1 min-w-0">
+                <div className="label text-warn">
+                  {isFa ? 'این مرحله نیاز به اصلاح داشت' : 'Needed an adjustment'}
+                </div>
+                <p className="text-sm text-ink-2 leading-relaxed">
+                  {isFa
+                    ? 'نتیجه‌ای آماده نشد. می‌توانیم همان درخواست را دوباره امتحان کنیم، آن را کمی ساده‌تر بازنویسی کنیم، یا به نسخهٔ قبلی برگردیم.'
+                    : 'I couldn\u2019t finalize a clean result. We can retry the same request, rephrase it a little, or restore a previous version from the panel below.'}
+                </p>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  className="btn-ghost btn-sm"
+                  onClick={onRephrase}
+                  disabled={!lastUserPrompt || busy !== null}
+                  title={isFa ? 'متن آخرین درخواست را برای ویرایش بازگردان' : 'Load your last prompt into the input for editing'}>
+                  {isFa ? '✎ بازنویسی' : '✎ Rephrase'}
+                </button>
+                <button
+                  className="btn-primary btn-sm"
+                  onClick={onRetry}
+                  disabled={!lastUserPrompt || busy !== null}
+                  title={isFa ? 'ارسال مجدد همان درخواست' : 'Resend the same request'}>
+                  {isFa ? '↻ تلاش دوباره' : '↻ Retry'}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {execution?.ok && rows && rows.length > 0 && (
         <div className="space-y-3">
