@@ -8,7 +8,8 @@ import { validatePipeline, lowerPipeline } from '@/lib/pipeline-guard';
 import {
   diffPipelines, isOverbroadEdit, summariseDiff,
 } from '@/lib/pipeline-diff';
-import { classifyRefinementIntentSmart } from '@/lib/llm-classifier';
+import { classifyRefinementIntentSmart, classifyTurnType } from '@/lib/llm-classifier';
+import { runConversationalTurn } from '@/lib/llm-conversation';
 import { checkLogicalConsistency } from '@/lib/pipeline-logic';
 import { dataDb, biDb, getServerInfo } from '@/lib/mongo';
 import { env } from '@/lib/env';
@@ -679,6 +680,30 @@ async function handleAgenticPost(req: Request, userId: string, reqId: string): P
     });
   }
   const lang = userLanguage(cleaned as ChatMessage[]);
+
+  // --- Conversational fast path -------------------------------------------
+  // Meta / recap / small-talk turns ("what conditions do we have?",
+  // "summarise", "list all filters", ack replies, greetings) are routed to
+  // a cheap free-tier model so they never burn OpenAI tokens and so the
+  // user never sees the heavyweight agentic prompt's stiff JSON-driven
+  // tone. The classifier is conservative: when in doubt it returns
+  // 'ambiguous' and we fall through to the data path. Data refinements
+  // never reach the conversational runner.
+  const lastUserMsgEarly = [...cleaned].reverse().find(m => m.role === 'user')?.content ?? '';
+  const turnType = await classifyTurnType(lastUserMsgEarly);
+  if (turnType === 'conversation') {
+    const trimmedEarly = cleaned.length > HISTORY_WINDOW ? cleaned.slice(-HISTORY_WINDOW) : cleaned;
+    const histEarly: ChatMessage[] = trimmedEarly.map(m => ({ role: m.role, content: m.content }));
+    const conv = await runConversationalTurn({ history: histEarly, lastReport: lastReport ?? null, lang });
+    console.info(`[agentic ${reqId}] conversational turn via ${conv.provider}${conv.model ? ` (${conv.model})` : ''}`);
+    return NextResponse.json({
+      kind: 'question',
+      message: conv.message,
+      needs: null,
+      repairs: [],
+    });
+  }
+
   const [digest, serverInfo] = await Promise.all([getSchema(false), getServerInfo()]);
   const version: [number, number] = [serverInfo.major, serverInfo.minor];
   // Sliding window: drop everything but the most recent N turns. The LLM

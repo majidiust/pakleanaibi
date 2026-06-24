@@ -82,6 +82,24 @@ export const env = {
   get CLASSIFIER_MODEL() { return opt('CLASSIFIER_MODEL', 'meta-llama/Llama-3.1-8B-Instruct'); },
   get CLASSIFIER_TIMEOUT_MS() { return num('CLASSIFIER_TIMEOUT_MS', 4000); },
 
+  // Conversational LLM used for META/RECAP turns and other non-data chat
+  // (recap of conditions, "what did I ask before?", clarifying answers,
+  // small talk). Runs on the same HF router as the classifier so it costs
+  // nothing under the existing HF_API_KEY. Heavier model than the
+  // classifier because the OUTPUT must be a coherent paragraph or bullet
+  // list, not a single label.
+  //   CONV_MODEL                   default Qwen2.5-72B-Instruct (better
+  //                                Persian than Llama-3.x)
+  //   CONV_FALLBACK_MODEL          OpenAI model used only when the HF
+  //                                router fails (timeout, 5xx, quota).
+  //                                gpt-4o-mini is ~10x cheaper than
+  //                                gpt-4o so a brief outage barely shows
+  //                                up on the bill.
+  //   CONV_TIMEOUT_MS              cap on a single conversational call.
+  get CONV_MODEL() { return opt('CONV_MODEL', 'Qwen/Qwen2.5-72B-Instruct'); },
+  get CONV_FALLBACK_MODEL() { return opt('CONV_FALLBACK_MODEL', 'gpt-4o-mini'); },
+  get CONV_TIMEOUT_MS() { return num('CONV_TIMEOUT_MS', 8000); },
+
   get REPORT_MAX_ROWS() { return num('REPORT_MAX_ROWS', 1000); },
   get REPORT_MAX_TIME_MS() { return num('REPORT_MAX_TIME_MS', 15000); },
 

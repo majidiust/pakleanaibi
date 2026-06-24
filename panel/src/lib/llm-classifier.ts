@@ -89,6 +89,127 @@ function parseLabel(raw: string | null | undefined): RefinementIntent | null {
   return (m?.[0] as RefinementIntent | undefined) ?? null;
 }
 
+// Turn-type classifier: decides whether to send the next turn to the
+// conversational LLM (free) or to the heavy OpenAI agentic call. Output
+// is one of:
+//   conversation  meta/recap question about the existing session
+//                 ("what conditions do we have?", "summarise", "list
+//                 filters", "what did I ask?", greetings, thanks)
+//   data          new query / refinement / data action
+//   ambiguous     can't tell from wording alone
+//
+// Ambiguous routes to the heavy path so we never SKIP a real data
+// request to save tokens. The cheap miss is "send a recap turn to
+// OpenAI"; the expensive miss is "answer a real data question with a
+// chat reply". This bias is intentional.
+type TurnType = 'conversation' | 'data' | 'ambiguous';
+
+const turnCache = new Map<string, TurnType>();
+function turnCacheGet(k: string): TurnType | undefined {
+  const v = turnCache.get(k);
+  if (v !== undefined) { turnCache.delete(k); turnCache.set(k, v); }
+  return v;
+}
+function turnCacheSet(k: string, v: TurnType): void {
+  if (turnCache.has(k)) turnCache.delete(k);
+  turnCache.set(k, v);
+  if (turnCache.size > CACHE_MAX) {
+    const oldest = turnCache.keys().next().value;
+    if (oldest !== undefined) turnCache.delete(oldest);
+  }
+}
+
+const TURN_TYPE_PROMPT = `You are routing a user message inside a chat-based BI
+reporting tool. The user has already produced one or more reports earlier in
+the session (with filters, conditions, joins). Classify their LATEST message
+into exactly one of:
+
+  conversation  They are asking ABOUT what already exists in this session, or
+                making small-talk. Examples: "what conditions do we have so
+                far?", "list all filters", "explain the current report",
+                "what did I ask before?", "summarise", "thanks", "hello",
+                "what does this column mean?", "yes/no/ok" as a reply to a
+                prior assistant question. Persian/Farsi/Arabic equivalents
+                count: "چه شرط‌هایی داریم", "خلاصه کن", "چی پرسیدم", "بله",
+                "ممنون".
+
+  data          They want NEW data, a CHANGE to the query, or a NEW analysis.
+                Examples: "add a filter for last month", "show me top 10
+                customers", "remove this column", "group by city", "change
+                the limit to 50", "make it a bar chart", any imperative that
+                implies running or modifying a pipeline.
+
+  ambiguous     Cannot tell from the wording alone. When in doubt, choose
+                ambiguous (the system will route to the data path safely).
+
+Reply with a SINGLE WORD: conversation, data, or ambiguous. No punctuation,
+no explanation.`;
+
+function parseTurnType(raw: string | null | undefined): TurnType | null {
+  if (!raw) return null;
+  const m = raw.trim().toLowerCase().match(/conversation|data|ambiguous/);
+  return (m?.[0] as TurnType | undefined) ?? null;
+}
+
+// Fallback heuristic when the LLM call is unavailable. Conservative:
+// only flags clearly conversational phrasing, otherwise returns
+// 'ambiguous' so the heavy data path still wins.
+function turnTypeHeuristic(message: string): TurnType {
+  const m = message.toLowerCase().trim();
+  if (!m) return 'ambiguous';
+  // Single-word acks / greetings — clearly conversational.
+  if (/^(yes|no|ok|okay|sure|thanks|thank you|hi|hello|hey)\.?$/.test(m)) return 'conversation';
+  // Persian acks / thanks / greetings.
+  if (/^(بله|آره|نه|باشه|ممنون|سلام|درود|مرسی)[.!?]?$/.test(m)) return 'conversation';
+  // English recap phrasing.
+  if (/\b(what (are|is) (the |our |current )?(conditions?|filters?|rules?))\b/.test(m)) return 'conversation';
+  if (/\b(list (all |the )?(conditions?|filters?|rules?))\b/.test(m)) return 'conversation';
+  if (/\b(summari[sz]e|recap|explain (the |this )?report)\b/.test(m)) return 'conversation';
+  if (/\b(what did i ask|what (did|do) we (have|do)|what does (this|the) pipeline)\b/.test(m)) return 'conversation';
+  // Persian recap phrasing.
+  if (/(چه شرط|چه فیلتر|شرط(ها)?ی? که|فیلتر(ها)?ی? که)/.test(message)) return 'conversation';
+  if (/(خلاصه|چی پرسیدم|قبلاً? چی|گزارش چه کاری|توضیح بده)/.test(message)) return 'conversation';
+  return 'ambiguous';
+}
+
+export async function classifyTurnType(message: string): Promise<TurnType> {
+  const trimmed = (message || '').trim();
+  if (!trimmed) return 'ambiguous';
+  const cached = turnCacheGet(trimmed);
+  if (cached) return cached;
+
+  const c = client();
+  if (!c) {
+    const v = turnTypeHeuristic(trimmed);
+    turnCacheSet(trimmed, v);
+    return v;
+  }
+  try {
+    const resp = await withTimeout(
+      c.chat.completions.create({
+        model: env.CLASSIFIER_MODEL,
+        temperature: 0,
+        max_tokens: 12,
+        messages: [
+          { role: 'system', content: TURN_TYPE_PROMPT },
+          { role: 'user', content: trimmed },
+        ],
+      }),
+      env.CLASSIFIER_TIMEOUT_MS,
+      'turn-type',
+    );
+    const label = parseTurnType(resp.choices?.[0]?.message?.content);
+    const v = label ?? turnTypeHeuristic(trimmed);
+    turnCacheSet(trimmed, v);
+    return v;
+  } catch (e) {
+    console.warn('[turn-type] falling back to heuristic:', e instanceof Error ? e.message : String(e));
+    const v = turnTypeHeuristic(trimmed);
+    turnCacheSet(trimmed, v);
+    return v;
+  }
+}
+
 // Public entry point. Returns a refinement intent for the given user
 // message. When the classifier client is unconfigured, fails, or times
 // out, falls back to the keyword classifier so callers don't have to
