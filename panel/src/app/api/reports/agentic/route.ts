@@ -147,6 +147,17 @@ function precheckLogic(report: LlmReport): PrecheckResult {
 // Validate + execute a single report. Returns the sealed report (with the
 // pipeline as the guard returned it) and an Execution result. Never throws
 // — Mongo errors become { ok:false, error }.
+//
+// IMPORTANT: the sealed pipeline is the POST-VALIDATION, PRE-LOWERING form
+// — i.e. EJSON shorthand wrappers like {"$oid":"..."} and {"$date":"..."}
+// are preserved. Lowering produces real BSON ObjectId / Date instances that
+// JSON.stringify (called by NextResponse.json) reduces to bare hex / ISO
+// strings, which would erase the corrections the autofix pass made (e.g.
+// {"$oid":"<hex>"} → "<hex>") and ship the buggy form back to the client.
+// Templates, version snapshots, and the next turn's `lastReport` echo all
+// derive from sealed.pipeline, so they MUST carry the corrected EJSON form.
+// The lowered tree is used ONLY for the Mongo driver call inside this
+// function and is intentionally not exposed past the driver boundary.
 async function runReport(db: Db, report: LlmReport, version: [number, number]): Promise<{ sealed: LlmReport; execution: Execution }> {
   let validated;
   try { validated = validatePipeline({ collection: report.collection, pipeline: report.pipeline }); }
@@ -156,18 +167,19 @@ async function runReport(db: Db, report: LlmReport, version: [number, number]): 
       execution: { ok: false, error: 'invalid_pipeline: ' + (e instanceof Error ? e.message : String(e)) },
     };
   }
-  // Rewrite modern date-math operators into literals for older servers.
-  // Surfaces a clear error back to the self-repair loop when something
-  // genuinely can't be lowered.
+  const sealed: LlmReport = { ...report, collection: validated.collection, pipeline: validated.pipeline };
+  // Rewrite modern date-math operators into literals for older servers and
+  // decode EJSON shorthand into real BSON values for the driver. Surfaces a
+  // clear error back to the self-repair loop when something genuinely can't
+  // be lowered. The lowered tree is local to this call site.
   let lowered: Record<string, unknown>[];
   try { lowered = lowerPipeline(validated.pipeline, version); }
   catch (e) {
     return {
-      sealed: { ...report, collection: validated.collection, pipeline: validated.pipeline },
+      sealed,
       execution: { ok: false, error: 'unsupported_operator: ' + (e instanceof Error ? e.message : String(e)) },
     };
   }
-  const sealed: LlmReport = { ...report, collection: validated.collection, pipeline: lowered };
   const t0 = Date.now();
   try {
     const rows = await db.collection(validated.collection)
