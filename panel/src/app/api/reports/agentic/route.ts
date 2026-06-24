@@ -48,6 +48,12 @@ const Body = z.object({
   // successful report turn. Optional: ad-hoc / unsaved runs (no id yet)
   // simply skip the version write \u2014 the chat still works end-to-end.
   conversationId: z.string().optional(),
+  // The version this turn is refining FROM. Lets the server record the
+  // tree edge between the new snapshot and the snapshot the user was
+  // viewing when they typed their message. Defaults to the tip of the
+  // versions array when omitted (legacy clients) so existing chats keep
+  // building a linear trunk.
+  parentVersionId: z.string().optional(),
 });
 
 // Cap the embedded versions array so a long-lived conversation can't grow
@@ -554,6 +560,42 @@ interface ConversationVersion {
   // Number of repair attempts the loop took before this version was
   // produced. 0 for a clean first-try report.
   repairCount: number;
+  // Tree-versioning fields. parentVersionId points at the version this
+  // turn was refined FROM (null for the first version of a conversation).
+  // It enables a tree UI where branching from a restored snapshot creates
+  // a sibling rather than overwriting the linear history. summary is a
+  // short human-readable stage diff vs the parent (cached at write time
+  // so the versions panel can render a tree without re-diffing on render).
+  parentVersionId: string | null;
+  diffSummary: string | null;
+}
+
+// Resolve the version this turn descends from. When the caller passed an
+// explicit parentVersionId, we look it up by id; otherwise we return the
+// tip of the versions array (newest entry). Returns null when no parent
+// exists \u2014 the first version of a conversation, or a conversation that
+// hasn't persisted any versions yet. Resilient to Mongo errors: a failed
+// read yields null so the write still proceeds as an orphan root.
+async function resolveParentVersion(
+  conversationId: string, userId: string, explicitId: string | null,
+): Promise<ConversationVersion | null> {
+  if (!ObjectId.isValid(conversationId)) return null;
+  try {
+    const db = await biDb();
+    const doc = await db.collection<{ versions?: ConversationVersion[] }>('agentic_conversations').findOne(
+      { _id: new ObjectId(conversationId), userId },
+      { projection: { versions: 1 } },
+    );
+    const versions = doc?.versions ?? [];
+    if (versions.length === 0) return null;
+    if (explicitId) {
+      const found = versions.find(x => x.id === explicitId);
+      if (found) return found;
+    }
+    return versions[versions.length - 1];
+  } catch {
+    return null;
+  }
 }
 
 async function appendConversationVersion(
@@ -608,7 +650,7 @@ async function handleAgenticPost(req: Request, userId: string, reqId: string): P
     });
   }
 
-  const { history, lastReport, execute = true, maxRepairs = 2, conversationId } = parsed.data;
+  const { history, lastReport, execute = true, maxRepairs = 2, conversationId, parentVersionId } = parsed.data;
   // Drop empty/whitespace-only entries before the LLM sees them. Pure-report
   // assistant turns previously persisted with content='' on the client; those
   // shouldn't count as conversation. After filtering we must still have a
@@ -891,6 +933,15 @@ async function handleAgenticPost(req: Request, userId: string, reqId: string): P
   let savedVersion: ConversationVersion | null = null;
   if (conversationId && execute) {
     const lastUserMsg = [...trimmed].reverse().find(m => m.role === 'user')?.content ?? '';
+    // Resolve the parent version. When the client supplied parentVersionId
+    // we trust it (the user explicitly branched from a restored snapshot).
+    // Otherwise we fall back to the current tip so a normal "send" extends
+    // the trunk. Both lookups read existing versions from the doc; failure
+    // simply yields null (orphan root).
+    const parent = await resolveParentVersion(conversationId, userId, parentVersionId ?? null);
+    const diffSummary = parent
+      ? summariseDiff(diffPipelines(parent.collection, parent.pipeline, finalReport.collection, finalReport.pipeline))
+      : null;
     const v: ConversationVersion = {
       id: new ObjectId().toHexString(),
       createdAt: new Date(),
@@ -913,6 +964,8 @@ async function handleAgenticPost(req: Request, userId: string, reqId: string): P
       verification: undefined,
       triggerMessage: lastUserMsg.slice(0, 200),
       repairCount: Math.max(0, attempts.length - 1),
+      parentVersionId: parent?.id ?? null,
+      diffSummary,
     };
     const ok = await appendConversationVersion(conversationId, userId, v);
     if (ok) savedVersion = v;

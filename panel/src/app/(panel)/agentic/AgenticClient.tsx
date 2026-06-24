@@ -45,6 +45,11 @@ export interface ConversationVersion {
   verification?: { ok: false; issue: string };
   triggerMessage: string;
   repairCount: number;
+  // Tree-versioning fields written by the server on every snapshot. Older
+  // snapshots (from before Phase C) may not carry these — the UI treats
+  // missing values as roots / un-summarised.
+  parentVersionId?: string | null;
+  diffSummary?: string | null;
 }
 interface TurnResponse {
   kind: 'question' | 'report';
@@ -107,6 +112,10 @@ export function AgenticClient({ user, currentUserId, initialTemplateId }: { user
   // Populated from GET /api/agentic/conversations/[id] on load and appended
   // by every successful agentic POST that returns savedVersion.
   const [versions, setVersions] = useState<ConversationVersion[]>([]);
+  // The version the next user turn will branch FROM. Updated when the user
+  // restores or branches from a non-tip snapshot. When null the server
+  // defaults to the tip of the trunk, so a fresh chat behaves linearly.
+  const [currentVersionId, setCurrentVersionId] = useState<string | null>(null);
   const chatRef = useRef<HTMLDivElement>(null);
   // Tracks the last persisted payload so the autosave effect can skip
   // identical writes (e.g. when the user merely toggles a UI control).
@@ -239,6 +248,10 @@ export function AgenticClient({ user, currentUserId, initialTemplateId }: { user
           // this conversation’s versions[] after the turn. Unset for the
           // very first user turn before lazy-creation completes.
           conversationId: cid ?? undefined,
+          // Declare the version the user is refining FROM so the server can
+          // record the tree edge. Omitted for the first turn / linear extend
+          // — the server then falls back to the current tip on its end.
+          parentVersionId: currentVersionId ?? undefined,
         }),
       });
       // Tolerant body decoding: under transient backend faults (uncaught
@@ -301,7 +314,13 @@ export function AgenticClient({ user, currentUserId, initialTemplateId }: { user
         // Append the server-persisted version snapshot to the local list so
         // the versions panel updates immediately without an extra GET.
         if (j.savedVersion) {
-          setVersions(vs => [...vs, j.savedVersion as ConversationVersion]);
+          const sv = j.savedVersion as ConversationVersion;
+          setVersions(vs => [...vs, sv]);
+          // Advance the branch pointer onto the freshly written version so
+          // the NEXT user turn extends from this snapshot rather than the
+          // one we started from. Branching only re-routes the pointer; it
+          // doesn't get reset by a normal extend.
+          setCurrentVersionId(sv.id);
         }
       }
     } catch (e) {
@@ -311,7 +330,7 @@ export function AgenticClient({ user, currentUserId, initialTemplateId }: { user
       console.warn('[agentic] fetch failed', e);
       setErr(friendlyTransport());
     } finally { setBusy(null); }
-  }, [history, report, busy, attached, conversationId]);
+  }, [history, report, busy, attached, conversationId, currentVersionId]);
 
   // When the agent asked a date question (kind=question + needs={type:date|dateRange})
   // and the user picked a date in the inline Jalali calendar, we format the
@@ -406,7 +425,12 @@ export function AgenticClient({ user, currentUserId, initialTemplateId }: { user
       setConversationId(j.id);
       setHistory(j.history ?? []);
       setReport(j.lastReport ?? null);
-      setVersions(j.versions ?? []);
+      const loadedVersions = j.versions ?? [];
+      setVersions(loadedVersions);
+      // Seed the branch pointer onto the tip so the next turn extends
+      // the trunk by default (matches what the user sees in the report
+      // pane on load).
+      setCurrentVersionId(loadedVersions.length > 0 ? loadedVersions[loadedVersions.length - 1].id : null);
       setExecution(null);
       setInput(''); setAttached([]);
       // Seed lastSavedRef so the autosave effect doesn't immediately rewrite
@@ -470,6 +494,17 @@ export function AgenticClient({ user, currentUserId, initialTemplateId }: { user
     });
     setExecution(null);
     setErr(null);
+    // Park the branch pointer on the restored snapshot so the NEXT user
+    // turn descends from it (creating a sibling of whatever followed it
+    // before) instead of silently extending the trunk tip.
+    setCurrentVersionId(v.id);
+  }, []);
+
+  // Re-point the next turn at an arbitrary version without changing the
+  // active report pane. Useful when the user wants to experiment on a
+  // branch without losing the pipeline they're currently looking at.
+  const branchFromVersion = useCallback((v: ConversationVersion) => {
+    setCurrentVersionId(v.id);
   }, []);
 
   // Export the conversation that's currently in view as a .txt file. Uses
@@ -547,6 +582,9 @@ export function AgenticClient({ user, currentUserId, initialTemplateId }: { user
           canSave={report !== null && (execution?.ok ?? false)}
           versions={versions}
           onRestoreVersion={restoreVersion}
+          onBranchVersion={branchFromVersion}
+          currentVersionId={currentVersionId}
+          conversationId={conversationId}
           lastUserPrompt={lastUserPrompt}
           onRetry={() => { if (lastUserPrompt) sendTurn(lastUserPrompt); }}
           onRephrase={() => { if (lastUserPrompt) setInput(lastUserPrompt); }}
@@ -587,13 +625,16 @@ export function AgenticClient({ user, currentUserId, initialTemplateId }: { user
   );
 }
 
-function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, canSave, versions, onRestoreVersion, lastUserPrompt, onRetry, onRephrase, templateOrigin }: {
+function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, canSave, versions, onRestoreVersion, onBranchVersion, currentVersionId, conversationId, lastUserPrompt, onRetry, onRephrase, templateOrigin }: {
   report: LlmReport | null; execution: Execution | null;
   busy: 'turn' | 'exec' | null; onExecute: () => void;
   onSaveAsTemplate: () => void;
   canSave: boolean;
   versions: ConversationVersion[];
   onRestoreVersion: (v: ConversationVersion) => void;
+  onBranchVersion: (v: ConversationVersion) => void;
+  currentVersionId: string | null;
+  conversationId: string | null;
   lastUserPrompt: string | undefined;
   onRetry: () => void;
   onRephrase: () => void;
@@ -725,52 +766,92 @@ function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, can
         </div>
       )}
 
-      <VersionsPanel
+      <VersionsTree
         versions={versions}
         activePipeline={report.pipeline}
+        currentVersionId={currentVersionId}
+        conversationId={conversationId}
         onRestore={onRestoreVersion}
+        onBranch={onBranchVersion}
       />
     </div>
   );
 }
 
-// Browse / restore prior generated pipelines within this conversation.
-// Rendered below the active report card. Each row summarises one version
-// snapshot (timestamp, source, row count or error, the user message that
-// triggered it) and links to a Restore action that swaps the snapshot back
-// into the active report pane. The current version is highlighted by
-// comparing pipelines structurally.
-function VersionsPanel({ versions, activePipeline, onRestore }: {
+// Browse / restore / branch prior generated pipelines within this
+// conversation. Renders versions as a TREE built from each snapshot's
+// parentVersionId: a normal "send" extends the trunk linearly; restoring a
+// non-tip version and refining creates a sibling branch. Two actions live
+// per node: Restore (loads the pipeline AND parks the branch pointer here)
+// and Branch (parks the pointer without changing the active pipeline). A
+// "Compare with current" link fetches the diff endpoint and renders a
+// stage-level breakdown in a modal.
+function VersionsTree({ versions, activePipeline, currentVersionId, conversationId, onRestore, onBranch }: {
   versions: ConversationVersion[];
   activePipeline: Record<string, unknown>[];
+  currentVersionId: string | null;
+  conversationId: string | null;
   onRestore: (v: ConversationVersion) => void;
+  onBranch: (v: ConversationVersion) => void;
 }) {
-  if (versions.length === 0) {
-    return null;
-  }
+  const [compareTarget, setCompareTarget] = useState<ConversationVersion | null>(null);
+  if (versions.length === 0) return null;
+
   const activeKey = JSON.stringify(activePipeline);
-  // Newest first — the most recent refinement is what analysts usually
-  // want to inspect.
-  const ordered = [...versions].slice().reverse();
+  const indexById = new Map(versions.map((v, i) => [v.id, i + 1] as const));
+  // Build adjacency map: parentVersionId -> children, preserving creation
+  // order. Versions without a known parent (legacy snapshots or the very
+  // first turn) become roots; we render roots in order.
+  const childrenOf = new Map<string | null, ConversationVersion[]>();
+  for (const v of versions) {
+    const key: string | null = v.parentVersionId && indexById.has(v.parentVersionId) ? v.parentVersionId : null;
+    const arr = childrenOf.get(key) ?? [];
+    arr.push(v);
+    childrenOf.set(key, arr);
+  }
+  const roots = childrenOf.get(null) ?? [];
+
+  // Depth-first walk; depth controls left indentation in REM so the trunk
+  // (depth 0) hugs the left edge and branches step inward. We compute the
+  // rendered rows up-front to keep the JSX flat.
+  const rows: Array<{ v: ConversationVersion; depth: number; isLastChild: boolean }> = [];
+  const walk = (parentId: string | null, depth: number) => {
+    const kids = childrenOf.get(parentId) ?? [];
+    kids.forEach((v, i) => {
+      rows.push({ v, depth, isLastChild: i === kids.length - 1 });
+      walk(v.id, depth + 1);
+    });
+  };
+  for (const r of roots) {
+    rows.push({ v: r, depth: 0, isLastChild: roots.indexOf(r) === roots.length - 1 });
+    walk(r.id, 1);
+  }
+
   return (
     <div className="card card-pad space-y-2">
-      <details>
+      <details open={versions.length <= 5}>
         <summary className="cursor-pointer text-sm font-medium text-ink-2 flex items-center gap-2">
           <span>Versions</span>
           <span className="pill num text-2xs">{versions.length}</span>
           <span className="text-2xs text-muted font-normal">
-            · every generated query is saved automatically
+            · branches form when you refine from a restored snapshot
           </span>
         </summary>
         <div className="mt-3 divide-y divide-line/60">
-          {ordered.map((v, i) => {
+          {rows.map(({ v, depth }) => {
             const isActive = JSON.stringify(v.pipeline) === activeKey;
-            const idx = versions.length - i; // human-readable: v1 = oldest
+            const isBranchTip = currentVersionId === v.id;
+            const idx = indexById.get(v.id) ?? 0;
             const when = new Date(v.createdAt);
             const tsLabel = `${when.toLocaleDateString()} ${when.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
             return (
               <div key={v.id}
-                className={['py-2 flex items-start gap-3', isActive ? 'bg-accent/5 -mx-2 px-2 rounded' : ''].join(' ')}>
+                style={{ paddingLeft: `${depth * 1.25}rem` }}
+                className={['py-2 flex items-start gap-3 relative',
+                  isActive ? 'bg-accent/5 -mx-2 px-2 rounded' : ''].join(' ')}>
+                {depth > 0 && (
+                  <span aria-hidden className="absolute left-0 top-3 text-muted text-xs select-none" style={{ marginLeft: `${(depth - 1) * 1.25 + 0.25}rem` }}>↳</span>
+                )}
                 <div className="flex-1 min-w-0 space-y-1">
                   <div className="flex items-center gap-2 flex-wrap text-2xs">
                     <span className="pill num">v{idx}</span>
@@ -781,6 +862,7 @@ function VersionsPanel({ versions, activePipeline, onRestore }: {
                     {v.verification && !v.verification.ok && <span className="pill text-warn" title={v.verification.issue}>verification flagged</span>}
                     <span className="text-muted">{tsLabel}</span>
                     {isActive && <span className="text-accent-hi">· current</span>}
+                    {!isActive && isBranchTip && <span className="text-accent-hi" title="The next turn will branch from this version">· branch point</span>}
                   </div>
                   {v.triggerMessage && (
                     <div dir="auto" className="text-xs text-ink-2 truncate" title={v.triggerMessage}>
@@ -789,21 +871,42 @@ function VersionsPanel({ versions, activePipeline, onRestore }: {
                   )}
                   <div className="text-2xs text-muted truncate" title={v.collection}>
                     <span className="font-mono">{v.collection}</span> · {v.pipeline.length} stage{v.pipeline.length === 1 ? '' : 's'}
+                    {v.diffSummary && <> · <span title="Change versus the parent version">{v.diffSummary}</span></>}
                   </div>
                 </div>
-                <button
-                  type="button"
-                  className="btn-ghost btn-sm shrink-0"
-                  disabled={isActive}
-                  onClick={() => onRestore(v)}
-                  title={isActive ? 'This version is currently active' : 'Load this pipeline back into the report pane'}>
-                  {isActive ? 'Current' : 'Restore'}
-                </button>
+                <div className="shrink-0 flex items-center gap-1">
+                  {!isActive && conversationId && (
+                    <button type="button" className="btn-ghost btn-sm" onClick={() => setCompareTarget(v)} title="Compare this version with the active report">
+                      Compare
+                    </button>
+                  )}
+                  {!isActive && !isBranchTip && (
+                    <button type="button" className="btn-ghost btn-sm" onClick={() => onBranch(v)} title="Send the next turn from this version without changing the active report">
+                      Branch
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="btn-ghost btn-sm"
+                    disabled={isActive}
+                    onClick={() => onRestore(v)}
+                    title={isActive ? 'This version is currently active' : 'Load this pipeline back into the report pane'}>
+                    {isActive ? 'Current' : 'Restore'}
+                  </button>
+                </div>
               </div>
             );
           })}
         </div>
       </details>
+      {compareTarget && conversationId && (
+        <CompareVersionsModal
+          conversationId={conversationId}
+          a={compareTarget}
+          b={versions.find(x => JSON.stringify(x.pipeline) === activeKey) ?? versions[versions.length - 1]}
+          onClose={() => setCompareTarget(null)}
+        />
+      )}
     </div>
   );
 }
@@ -911,6 +1014,105 @@ function ChatPanel({ history, input, busy, chatRef, onInput, onSend, onExample, 
           <button className="btn-primary btn-sm" disabled={!input.trim() || busy !== null} onClick={onSend}>
             {busy === 'turn' ? 'Sending…' : 'Send'}
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Modal that fetches a stage-level diff between two persisted snapshots
+// and renders it as a flat list. Loading and not-found states surface as
+// soft notices — never as raw error strings, in keeping with the broader
+// "no technical messages on the wire" rule. The list is intentionally
+// coarse (op + status per position): sub-document deltas inside a stage
+// are something the analyst can inspect via the pipeline view itself.
+interface VersionDiffResponse {
+  a: { id: string; collection: string; pipeline: Record<string, unknown>[] };
+  b: { id: string; collection: string; pipeline: Record<string, unknown>[] };
+  diff: {
+    prevLen: number; nextLen: number;
+    unchanged: number; added: number; removed: number; modified: number;
+    perStage: Array<{ index: number; op: string; status: 'same' | 'modified' | 'added' | 'removed' }>;
+    collectionChanged: boolean;
+  };
+  summary: string;
+}
+function CompareVersionsModal({ conversationId, a, b, onClose }: {
+  conversationId: string;
+  a: ConversationVersion;
+  b: ConversationVersion;
+  onClose: () => void;
+}) {
+  const [data, setData] = useState<VersionDiffResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      setLoading(true); setErr(null);
+      try {
+        const r = await fetch(`/api/agentic/conversations/${conversationId}/versions/diff?a=${encodeURIComponent(a.id)}&b=${encodeURIComponent(b.id)}`);
+        if (!r.ok) {
+          if (!cancelled) setErr('Could not load the comparison. Please try again in a moment.');
+          return;
+        }
+        const j = await r.json() as VersionDiffResponse;
+        if (!cancelled) setData(j);
+      } catch (e) {
+        console.warn('[agentic] compare versions failed', e);
+        if (!cancelled) setErr('Could not reach the server to load the comparison.');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [conversationId, a.id, b.id]);
+
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-bg/80 backdrop-blur-sm" role="dialog" aria-modal="true">
+      <div className="card card-pad w-full max-w-2xl space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <div className="text-sm font-medium">Compare versions</div>
+          <button type="button" className="btn-subtle btn-sm" onClick={onClose} aria-label="Close">✕</button>
+        </div>
+        {loading && <div className="text-sm text-muted">Loading comparison…</div>}
+        {err && <div className="text-sm text-warn">{err}</div>}
+        {data && (
+          <div className="space-y-3">
+            <div className="text-xs text-muted">
+              <span className="font-mono">{a.collection}</span> → <span className="font-mono">{b.collection}</span>
+              {' · '}{data.summary}
+              {data.diff.collectionChanged && <span className="text-warn"> · collection changed</span>}
+            </div>
+            <div className="surface p-3 max-h-[50vh] overflow-y-auto">
+              <table className="w-full text-xs">
+                <thead className="text-muted">
+                  <tr>
+                    <th className="text-left py-1 pr-3">#</th>
+                    <th className="text-left py-1 pr-3">Stage</th>
+                    <th className="text-left py-1">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.diff.perStage.map(s => (
+                    <tr key={s.index} className="border-t border-line/40">
+                      <td className="py-1 pr-3 font-mono text-muted">{s.index + 1}</td>
+                      <td className="py-1 pr-3 font-mono">{s.op}</td>
+                      <td className="py-1">
+                        {s.status === 'same' && <span className="text-muted">unchanged</span>}
+                        {s.status === 'modified' && <span className="text-accent-hi">modified</span>}
+                        {s.status === 'added' && <span className="text-ok">added</span>}
+                        {s.status === 'removed' && <span className="text-warn">removed</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+        <div className="flex justify-end">
+          <button type="button" className="btn-ghost btn-sm" onClick={onClose}>Close</button>
         </div>
       </div>
     </div>
