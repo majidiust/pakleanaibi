@@ -472,6 +472,18 @@ broken piece must be copied byte-for-byte from the previous pipeline.
 If a refinement instruction is local in scope (rename a column, change
 a literal, swap a sort direction), leave every other stage untouched.
 
+ADDITIVE CONDITIONS: when the refinement adds a new conditional rule
+("items X = 25%", "for status=cancelled, show ..."), it is an
+ADDITION to the existing logic, NOT a replacement. Keep all prior
+condition branches byte-for-byte and append the new branch (convert
+a two-arm $cond to a $switch if needed). Never silently widen,
+narrow, or drop a predicate the user did not mention. If the new
+rule appears to be already covered by an existing branch, re-read
+the predicates carefully — the existing branch may be gated on MORE
+fields than the user's request; in that case add the new (broader
+or differently-gated) branch rather than returning a zero-change
+answer.
+
 Write the "explanation" in the same language as the question and briefly
 describe what was changed and why (1\u20132 sentences). Name only the piece
 that was actually modified — do not narrate untouched stages.`;
@@ -1054,6 +1066,38 @@ the previous version.
 
 For STRUCTURAL deltas, briefly justify in "message" why a full
 regenerate was necessary (one sentence) and then emit the new pipeline.
+
+ADDITIVE CONDITIONS (read carefully — this is the most common
+mistake): users build conditional logic INCREMENTALLY. Turn 1 they
+say "items A,B = 30%", turn 2 they say "items X,Y = 25%". The
+second message is NOT a replacement of the first — it is an ADDITION
+to it. The new pipeline must keep the A,B=30% branch AND add the
+X,Y=25% branch. Both rules coexist; the default fallback is reached
+only when neither matches.
+
+  - Treat every new conditional rule as a NEW BRANCH on the
+    existing $cond / $switch / $ifNull chain. If the previous
+    pipeline used a two-branch $cond, convert it to $switch and
+    APPEND the new branch; do NOT rewrite the existing condition.
+  - Preserve the existing predicates byte-for-byte. The username,
+    item id, status, date, threshold values from earlier turns stay
+    exactly as they were unless the user explicitly says "change
+    the previous rule" / "remove the rule for X" / "replace".
+  - When the new condition could be read as either additive OR a
+    replacement, prefer ADDITIVE and say so in "message" ("Added a
+    new branch: LSH = 37% when item = X. Existing rule for
+    username=0905910 is preserved."). If you genuinely cannot tell,
+    ASK ONE clarification question — do NOT silently overwrite.
+  - If the requested condition appears to already be satisfied by
+    the existing logic, DO NOT return a zero-change response with
+    "no changes needed". Re-read the $cond / $and / $or operands
+    carefully. The existing branch may be gated on MORE predicates
+    than the user's request (e.g. existing: item=X AND username=Y;
+    user request: item=X alone). In that case the request is
+    BROADER than the existing branch and must be added as a new,
+    less-restrictive branch ordered before the more-restrictive
+    one, or the existing predicate must be widened — pick whichever
+    matches the user's wording and explain the choice.
 
 AMBIGUOUS REFINEMENTS:
 - When the user's instruction COULD be local OR structural ("make it
