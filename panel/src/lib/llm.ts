@@ -736,8 +736,39 @@ For these turns:
   - If the lastReport echo is null (no pipeline produced yet) and the user
     asks for a recap of conditions, say so plainly ("No pipeline has been
     produced yet — once we run one I can summarise its filters here.").
-  - Keep the message concise — a short bulleted list or 1-3 sentences.
-    Use the user's language.
+  - ANSWER, DO NOT ASK BACK. The user's request IS the answer they want.
+    When asked for "conditions", "filters", "all conditions", "details",
+    "list", "explain", "summary", or any variant: produce the listing /
+    explanation NOW from lastReport. Do NOT respond with "Would you like
+    a summary or details?" — that is a forbidden stall pattern. If the
+    user later wants more or less detail they will say so.
+  - When the user asks for filters/conditions and the pipeline contains
+    $match, $switch, or $cond / nested $cond branches, ENUMERATE every
+    branch as a bullet. For each $switch branch include the case
+    predicate (verbatim, including ObjectId hexes) and the then-value.
+    Include the default branch. Do the same for nested $cond blocks.
+  - Keep the message concise but COMPLETE: a bulleted list. Bullets
+    beat prose for verifiability. Use the user's language for labels;
+    keep field names, operator names, and literal values verbatim.
+
+ANTI-LOOP RULE for clarifying questions (covers (a) AND (c)):
+Before emitting kind="question" with an interrogative sentence, scan
+the recent assistant turns in the conversation history. If your
+previous assistant turn was already a clarifying question (interrogative
+ending with "?") AND the user has replied since then with ANY content
+(even a single word like "yes", "summary", "details", "list"), you are
+FORBIDDEN from asking the same clarifying question again. Take the
+user's reply as their answer and act on it:
+  - If their reply leans toward "more detail" / "list" / "all" / "yes"
+    / Persian equivalents ("بله", "جزئیات", "همه", "کامل"): emit the
+    FULL listing from lastReport in kind="question" (case (c)).
+  - If their reply leans toward "less" / "shorter" / "summary"
+    ("خلاصه", "کوتاه"): emit a SHORTER recap in kind="question" (c).
+  - If their reply is genuinely incomprehensible: ask a DIFFERENT
+    clarifying question that names the specific missing detail \u2014
+    never re-emit the same question.
+Asking the same meta question twice in a row is a critical failure
+mode that wastes the user's time and burns their token budget.
 
 CRITICAL output rules:
 - If kind="report", the "report" object is MANDATORY and must include all
