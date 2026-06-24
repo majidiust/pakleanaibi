@@ -1,3 +1,4 @@
+import { ObjectId, Long } from 'mongodb';
 import { env } from './env';
 
 // Allowlist-based validator for LLM-generated aggregation pipelines.
@@ -249,23 +250,44 @@ export function lowerPipeline(
     if (node instanceof Date) return node;
     if (Array.isArray(node)) return node.map(walk);
     const o = node as Record<string, unknown>;
-    // EJSON date literal -> real BSON Date. Required everywhere because the
-    // MongoDB driver, when handed a plain {$date: "..."} object as a query
-    // value, does NOT auto-decode it; it sends it as an embedded document
-    // and the server compares Date >= Object -- which silently matches
-    // nothing under BSON type bracketing. We unconditionally rewrite so the
-    // driver serialises a real Date.
+    // EJSON literals -> real BSON values. The MongoDB driver does NOT
+    // auto-decode shorthand wrappers like {$date:...} / {$oid:...} when
+    // they appear as values inside a pipeline document tree — it ships
+    // them verbatim, and the server then either compares against an
+    // embedded document (silent zero rows) or, when the wrapper lands
+    // inside an expression context such as $eq/$cond/$addFields, tries
+    // to dispatch the wrapper key as an operator and throws
+    // "Unrecognized expression '$oid'". Decoding here once means the
+    // same {$oid:...} literal works in $match, $expr, $addFields, $project
+    // — anywhere the analyst (or LLM) writes it.
     const keys = Object.keys(o);
-    if (keys.length === 1 && keys[0] === '$date') {
-      const v = o.$date;
-      let ms: number | string | null = null;
-      if (typeof v === 'string' || typeof v === 'number') ms = v;
-      else if (v && typeof v === 'object' && '$numberLong' in (v as Record<string, unknown>)) {
-        ms = Number((v as { $numberLong: unknown }).$numberLong);
+    if (keys.length === 1) {
+      const k0 = keys[0];
+      if (k0 === '$date') {
+        const v = o.$date;
+        let ms: number | string | null = null;
+        if (typeof v === 'string' || typeof v === 'number') ms = v;
+        else if (v && typeof v === 'object' && '$numberLong' in (v as Record<string, unknown>)) {
+          ms = Number((v as { $numberLong: unknown }).$numberLong);
+        }
+        if (ms !== null) {
+          const d = new Date(ms);
+          if (!Number.isNaN(d.getTime())) return d;
+        }
       }
-      if (ms !== null) {
-        const d = new Date(ms);
-        if (!Number.isNaN(d.getTime())) return d;
+      if (k0 === '$oid' && typeof o.$oid === 'string' && /^[a-f0-9]{24}$/i.test(o.$oid)) {
+        try { return new ObjectId(o.$oid); } catch { /* fall through to verbatim walk */ }
+      }
+      if (k0 === '$numberLong' && (typeof o.$numberLong === 'string' || typeof o.$numberLong === 'number')) {
+        try { return Long.fromString(String(o.$numberLong)); } catch { /* ignore */ }
+      }
+      if (k0 === '$numberInt' && (typeof o.$numberInt === 'string' || typeof o.$numberInt === 'number')) {
+        const n = parseInt(String(o.$numberInt), 10);
+        if (Number.isFinite(n)) return n;
+      }
+      if (k0 === '$numberDouble' && (typeof o.$numberDouble === 'string' || typeof o.$numberDouble === 'number')) {
+        const n = parseFloat(String(o.$numberDouble));
+        if (Number.isFinite(n)) return n;
       }
     }
     // Lower $dateSubtract / $dateAdd if not supported.

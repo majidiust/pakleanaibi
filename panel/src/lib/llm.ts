@@ -892,6 +892,29 @@ auto-repair failures):
   "done") — never wrap them in $literal unless you need to disambiguate a
   string that itself starts with "$".
 
+ObjectId values (read carefully — silent zero-rows + "Unrecognized
+expression" failures both come from getting this wrong):
+- An ObjectId LITERAL is always emitted as {"$oid":"<24-hex-lowercase>"}.
+  This works in EVERY context — $match field values, $expr / $cond / $eq
+  inside $addFields or $project, $lookup join keys after $toObjectId is
+  unavailable, anywhere. The server-side guard decodes the wrapper into a
+  real BSON ObjectId before execution.
+- NEVER compare an _id (or any ObjectId-typed field) against a bare hex
+  STRING in any context. BSON type bracketing makes that silently match
+  nothing.
+    CORRECT (match):    { "$match": { "_id": {"$oid":"5e56456cf900052ed23d692b"} } }
+    CORRECT (expr):     { "$eq": ["$items_joined._id", {"$oid":"5e56456cf900052ed23d692b"}] }
+    WRONG (zero rows):  { "$eq": ["$items_joined._id", "5e56456cf900052ed23d692b"] }
+- NEVER wrap an {"$oid":"..."} literal inside $literal — that hides the
+  shorthand from the decoder and the server sees a literal sub-document,
+  not an ObjectId.
+- The 24-hex string MUST be exactly 24 lowercase a-f / 0-9 characters. If
+  the user wrote "5E56456C..." normalise to lowercase before emitting.
+- Other BSON shorthands behave the same way: {"$date":"<ISO>"} for BSON
+  Dates, {"$numberLong":"..."} for 64-bit ints, {"$numberDouble":"..."}
+  for floats when precision matters. The guard auto-decodes all of these,
+  so they can appear in ANY context (match or expression).
+
 $project literal values:
 - Inside $project, only 0/1 (and false/true) have special meaning
   (exclude/include). Any OTHER bare scalar — a number like 0.5, a string

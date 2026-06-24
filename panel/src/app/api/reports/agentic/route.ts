@@ -162,6 +162,40 @@ function enrichError(raw: string, broken: LlmReport): string {
       'A date comparison failed because the right-hand side was a string and the left-hand side is a BSON Date (or vice versa). Always emit dates as EJSON {"$date": "<ISO with Z>"} so the driver serialises a real BSON Date.',
     );
   }
+  // EJSON shorthand ({"$oid":"..."}, {"$numberLong":"..."}, {"$date":"..."})
+  // landing inside an expression operator ($eq / $cond / $addFields / $project
+  // computed) makes the server try to dispatch the shorthand key as an
+  // expression operator and fail with "Unrecognized expression '$xxx'". The
+  // pipeline-guard auto-decodes these literals before execution, so reaching
+  // this branch means a typo (e.g. 23-char hex, missing quotes, $-prefixed
+  // key inside a field-path expression) survived the rewrite.
+  if (
+    /unrecognized expression '\$(oid|date|numberlong|numberint|numberdouble|numberdecimal)'/.test(lower) ||
+    lower.includes("unrecognized expression '$oid'") ||
+    lower.includes("unrecognized expression '$date'")
+  ) {
+    hints.push(
+      'A BSON shorthand literal landed inside an aggregation expression and the server tried to evaluate the wrapper key (e.g. "$oid") as an operator. The server-side pipeline-guard already rewrites well-formed {"$oid":"<24hex>"} / {"$date":"<ISO>"} literals into real BSON values — so the failing literal is malformed: either the hex string is not exactly 24 lowercase characters, the date is not a full ISO timestamp with Z, or the shorthand was nested inside a $literal / quoted as a string.',
+      'Fix: for ObjectId comparisons emit a bare {"$oid":"<24-hex-lowercase>"} value. To compare an _id field against an ObjectId literal inside $expr / $cond use {"$eq": ["$_id", {"$oid": "5e56456cf900052ed23d692b"}]} — never wrap the {$oid:...} in $literal, never quote it as a JSON string.',
+      'If you need to compare against a STRING value that happens to look like a 24-hex ObjectId (e.g. a stored hex string in a non-_id field), use a plain JSON string literal "5e56…692b" instead of the $oid wrapper.',
+    );
+  }
+  // The "$expr" / $cond / $addFields ObjectId comparison anti-pattern: the
+  // model compared an _id (BSON ObjectId) against a bare 24-hex JSON string.
+  // MongoDB type bracketing makes that silently match nothing, so the user
+  // sees "0 rows" even though the syntax was accepted.
+  if (
+    lower.includes('returned 0 rows') ||
+    lower.includes('zero rows') ||
+    lower.includes('no documents matched')
+  ) {
+    const pipelineJson = JSON.stringify(broken.pipeline);
+    if (/"\$eq":\s*\[\s*"\$[a-zA-Z_.]+_id"?,\s*"[a-f0-9]{24}"/i.test(pipelineJson)) {
+      hints.push(
+        'A $eq comparison on an _id-typed field used a bare hex STRING literal, which never matches an ObjectId field under BSON type bracketing. Wrap the hex value in {"$oid": "<hex>"} so the driver sends a real ObjectId.',
+      );
+    }
+  }
   // Malformed expression shape — the model serialised an operator and its
   // arguments into the KEY of an object (e.g. `"$eq:["` ... or a duplicate
   // `$eq` key inside an `$and`). MongoDB reports this as "must have exactly
