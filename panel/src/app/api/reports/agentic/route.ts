@@ -6,8 +6,9 @@ import { getSchema, type SchemaDigest } from '@/lib/schema';
 import { agenticReport, isLlmOutputError, type ChatMessage, type LlmReport, type AgenticTurn } from '@/lib/llm';
 import { validatePipeline, lowerPipeline } from '@/lib/pipeline-guard';
 import {
-  diffPipelines, classifyRefinementIntent, isOverbroadEdit, summariseDiff,
+  diffPipelines, isOverbroadEdit, summariseDiff,
 } from '@/lib/pipeline-diff';
+import { classifyRefinementIntentSmart } from '@/lib/llm-classifier';
 import { checkLogicalConsistency } from '@/lib/pipeline-logic';
 import { dataDb, biDb, getServerInfo } from '@/lib/mongo';
 import { env } from '@/lib/env';
@@ -754,7 +755,7 @@ async function handleAgenticPost(req: Request, userId: string, reqId: string): P
   let refinedFirst = firstNormalized;
   if (lastReport) {
     const lastUserMsg = [...trimmed].reverse().find(m => m.role === 'user')?.content ?? '';
-    const intent = classifyRefinementIntent(lastUserMsg);
+    const intent = await classifyRefinementIntentSmart(lastUserMsg);
     if (intent === 'local') {
       const diff = diffPipelines(
         lastReport.collection, lastReport.pipeline as Record<string, unknown>[],

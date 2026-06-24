@@ -65,6 +65,19 @@ export const env = {
   get PROXY_HOST() { return opt('PROXY_HOST', '127.0.0.1'); },
   get PROXY_PORT() { return num('PROXY_PORT', 8080); },
 
+  // Optional secondary LLM used for cheap classification tasks (refinement
+  // intent, etc.) so we don't burn OpenAI tokens on questions that a free
+  // 3B/8B model can answer in one shot. Any OpenAI-compatible endpoint
+  // works: Groq, OpenRouter, Together, Gemini's OpenAI-compat URL. Leave
+  // empty to disable and fall back to the in-process keyword classifier.
+  //   CLASSIFIER_API_BASE_URL=https://api.groq.com/openai/v1
+  //   CLASSIFIER_MODEL=llama-3.1-8b-instant
+  //   CLASSIFIER_API_KEY=...
+  get CLASSIFIER_API_KEY() { return opt('CLASSIFIER_API_KEY', ''); },
+  get CLASSIFIER_API_BASE_URL() { return opt('CLASSIFIER_API_BASE_URL', ''); },
+  get CLASSIFIER_MODEL() { return opt('CLASSIFIER_MODEL', ''); },
+  get CLASSIFIER_TIMEOUT_MS() { return num('CLASSIFIER_TIMEOUT_MS', 4000); },
+
   get REPORT_MAX_ROWS() { return num('REPORT_MAX_ROWS', 1000); },
   get REPORT_MAX_TIME_MS() { return num('REPORT_MAX_TIME_MS', 15000); },
 
