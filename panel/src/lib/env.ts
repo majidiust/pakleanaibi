@@ -65,17 +65,21 @@ export const env = {
   get PROXY_HOST() { return opt('PROXY_HOST', '127.0.0.1'); },
   get PROXY_PORT() { return num('PROXY_PORT', 8080); },
 
-  // Optional secondary LLM used for cheap classification tasks (refinement
-  // intent, etc.) so we don't burn OpenAI tokens on questions that a free
-  // 3B/8B model can answer in one shot. Any OpenAI-compatible endpoint
-  // works: Groq, OpenRouter, Together, Gemini's OpenAI-compat URL. Leave
-  // empty to disable and fall back to the in-process keyword classifier.
+  // Secondary LLM used for cheap classification tasks (refinement intent,
+  // etc.) so we don't burn OpenAI tokens on decisions a small free model
+  // can make in one shot. Defaults to Hugging Face's OpenAI-compatible
+  // router and reuses HF_API_KEY (the same key already used for
+  // embeddings); override with any OpenAI-compatible provider by setting
+  // the three CLASSIFIER_* env vars explicitly:
   //   CLASSIFIER_API_BASE_URL=https://api.groq.com/openai/v1
   //   CLASSIFIER_MODEL=llama-3.1-8b-instant
-  //   CLASSIFIER_API_KEY=...
-  get CLASSIFIER_API_KEY() { return opt('CLASSIFIER_API_KEY', ''); },
-  get CLASSIFIER_API_BASE_URL() { return opt('CLASSIFIER_API_BASE_URL', ''); },
-  get CLASSIFIER_MODEL() { return opt('CLASSIFIER_MODEL', ''); },
+  //   CLASSIFIER_API_KEY=<provider key>
+  // When no key is available (CLASSIFIER_API_KEY and HF_API_KEY both
+  // empty), the classifier silently falls back to the in-process keyword
+  // heuristic so deployments without any HF/OpenAI-compat key still work.
+  get CLASSIFIER_API_KEY() { return opt('CLASSIFIER_API_KEY', '') || opt('HF_API_KEY', ''); },
+  get CLASSIFIER_API_BASE_URL() { return opt('CLASSIFIER_API_BASE_URL', 'https://router.huggingface.co/v1'); },
+  get CLASSIFIER_MODEL() { return opt('CLASSIFIER_MODEL', 'meta-llama/Llama-3.1-8B-Instruct'); },
   get CLASSIFIER_TIMEOUT_MS() { return num('CLASSIFIER_TIMEOUT_MS', 4000); },
 
   get REPORT_MAX_ROWS() { return num('REPORT_MAX_ROWS', 1000); },

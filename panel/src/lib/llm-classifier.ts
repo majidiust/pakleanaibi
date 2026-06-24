@@ -111,7 +111,11 @@ export async function classifyRefinementIntentSmart(message: string): Promise<Re
       c.chat.completions.create({
         model: env.CLASSIFIER_MODEL,
         temperature: 0,
-        max_tokens: 4,
+        // Bumped from 4 to 12 because some tokenizers (notably Llama
+        // family) split "structural" into 2-3 tokens; a too-tight cap
+        // returns a truncated label that parseLabel would reject and
+        // force a fallback for no good reason.
+        max_tokens: 12,
         messages: [
           { role: 'system', content: REFINEMENT_PROMPT },
           { role: 'user', content: trimmed },
