@@ -45,6 +45,11 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
     description: doc.description ?? '',
     history: doc.history ?? [],
     lastReport: doc.lastReport ?? null,
+    // Version snapshots written by the agentic POST handler on every
+    // successful report turn. Each entry contains the generated pipeline
+    // plus execution / verification stats so the client can browse and
+    // restore prior queries within this conversation.
+    versions: doc.versions ?? [],
     messageCount: doc.messageCount ?? 0,
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,

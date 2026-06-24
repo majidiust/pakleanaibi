@@ -29,6 +29,23 @@ interface ChatMsg {
   kind?: 'question' | 'report' | 'repair';
   needs?: AgenticNeedsDate;
 }
+// A snapshot of a generated pipeline persisted on every successful report
+// turn. Mirrors the server-side ConversationVersion in
+// `api/reports/agentic/route.ts` — keep the two shapes in sync.
+export interface ConversationVersion {
+  id: string;
+  createdAt: string;
+  source: 'initial' | 'repair';
+  collection: string;
+  pipeline: Record<string, unknown>[];
+  display: LlmReport['display'];
+  explanation: string;
+  warnings: string[];
+  execution: { ok: boolean; count?: number; took?: number; truncated?: boolean; error?: string };
+  verification?: { ok: false; issue: string };
+  triggerMessage: string;
+  repairCount: number;
+}
 interface TurnResponse {
   kind: 'question' | 'report';
   message: string;
@@ -36,6 +53,10 @@ interface TurnResponse {
   execution?: Execution | null;
   repairs?: RepairAttempt[];
   needs?: AgenticNeedsDate | null;
+  // Freshly persisted snapshot — the client appends it to its local
+  // versions list without a follow-up GET. Null on question turns and on
+  // ad-hoc (no conversationId) runs.
+  savedVersion?: ConversationVersion | null;
 }
 
 const EXAMPLES = [
@@ -60,6 +81,10 @@ export function AgenticClient({ user }: { user: ExportUser }) {
   // after a save without us having to push state down.
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [historyRefresh, setHistoryRefresh] = useState(0);
+  // All saved version snapshots for the active conversation, oldest first.
+  // Populated from GET /api/agentic/conversations/[id] on load and appended
+  // by every successful agentic POST that returns savedVersion.
+  const [versions, setVersions] = useState<ConversationVersion[]>([]);
   const chatRef = useRef<HTMLDivElement>(null);
   // Tracks the last persisted payload so the autosave effect can skip
   // identical writes (e.g. when the user merely toggles a UI control).
@@ -132,6 +157,10 @@ export function AgenticClient({ user }: { user: ExportUser }) {
           history: recent,
           lastReport: report,
           execute: true,
+          // Including the id makes the server append a version snapshot to
+          // this conversation’s versions[] after the turn. Unset for the
+          // very first user turn before lazy-creation completes.
+          conversationId: cid ?? undefined,
         }),
       });
       // Tolerant body decoding: under transient backend faults (uncaught
@@ -177,6 +206,11 @@ export function AgenticClient({ user }: { user: ExportUser }) {
       if (j.kind === 'report' && j.report) {
         setReport(j.report);
         setExecution(j.execution ?? null);
+        // Append the server-persisted version snapshot to the local list so
+        // the versions panel updates immediately without an extra GET.
+        if (j.savedVersion) {
+          setVersions(vs => [...vs, j.savedVersion as ConversationVersion]);
+        }
       }
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'request failed');
@@ -265,10 +299,14 @@ export function AgenticClient({ user }: { user: ExportUser }) {
     try {
       const r = await fetch(`/api/agentic/conversations/${id}`);
       if (!r.ok) { setErr('Failed to load conversation'); return; }
-      const j = await r.json() as { id: string; history: ChatMsg[]; lastReport: LlmReport | null };
+      const j = await r.json() as {
+        id: string; history: ChatMsg[]; lastReport: LlmReport | null;
+        versions?: ConversationVersion[];
+      };
       setConversationId(j.id);
       setHistory(j.history ?? []);
       setReport(j.lastReport ?? null);
+      setVersions(j.versions ?? []);
       setExecution(null);
       setInput(''); setAttached([]);
       // Seed lastSavedRef so the autosave effect doesn't immediately rewrite
@@ -305,8 +343,26 @@ export function AgenticClient({ user }: { user: ExportUser }) {
     if (history.length > 0 && !confirm('Start a new conversation? The current one is already saved in History.')) return;
     setHistory([]); setReport(null); setExecution(null); setErr(null); setInput(''); setAttached([]);
     setConversationId(null);
+    setVersions([]);
     lastSavedRef.current = '';
   }
+
+  // Load a saved version's snapshot back into the active report pane. The
+  // chat history is left intact — only the report state changes — so the
+  // analyst can "rewind" to a prior generated pipeline without losing the
+  // conversation context. Execution rows are cleared because they belonged
+  // to a different run; the user re-clicks ▶ Execute to refresh.
+  const restoreVersion = useCallback((v: ConversationVersion) => {
+    setReport({
+      collection: v.collection,
+      pipeline: v.pipeline,
+      display: v.display,
+      explanation: v.explanation,
+      warnings: v.warnings,
+    });
+    setExecution(null);
+    setErr(null);
+  }, []);
 
   // Export the conversation that's currently in view as a .txt file. Uses
   // local state so it works even before the autosave PATCH has finished —
@@ -346,7 +402,8 @@ export function AgenticClient({ user }: { user: ExportUser }) {
               // tombstone.
               if (id === conversationId) {
                 setConversationId(null); setHistory([]); setReport(null);
-                setExecution(null); setInput(''); setAttached([]); lastSavedRef.current = '';
+                setExecution(null); setInput(''); setAttached([]); setVersions([]);
+                lastSavedRef.current = '';
               }
             }}
           />
@@ -375,6 +432,8 @@ export function AgenticClient({ user }: { user: ExportUser }) {
           onExecute={executeReport}
           onSaveAsTemplate={() => setSavingTemplate(true)}
           canSave={report !== null && (execution?.ok ?? false)}
+          versions={versions}
+          onRestoreVersion={restoreVersion}
         />
         <ChatPanel
           history={history} input={input} busy={busy} chatRef={chatRef}
@@ -402,11 +461,13 @@ export function AgenticClient({ user }: { user: ExportUser }) {
   );
 }
 
-function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, canSave }: {
+function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, canSave, versions, onRestoreVersion }: {
   report: LlmReport | null; execution: Execution | null;
   busy: 'turn' | 'exec' | null; onExecute: () => void;
   onSaveAsTemplate: () => void;
   canSave: boolean;
+  versions: ConversationVersion[];
+  onRestoreVersion: (v: ConversationVersion) => void;
 }) {
   if (!report) {
     return (
@@ -489,6 +550,86 @@ function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, can
           Pipeline ready but not executed yet. Click <span className="font-medium text-ink">▶ Execute</span> above to run it.
         </div>
       )}
+
+      <VersionsPanel
+        versions={versions}
+        activePipeline={report.pipeline}
+        onRestore={onRestoreVersion}
+      />
+    </div>
+  );
+}
+
+// Browse / restore prior generated pipelines within this conversation.
+// Rendered below the active report card. Each row summarises one version
+// snapshot (timestamp, source, row count or error, the user message that
+// triggered it) and links to a Restore action that swaps the snapshot back
+// into the active report pane. The current version is highlighted by
+// comparing pipelines structurally.
+function VersionsPanel({ versions, activePipeline, onRestore }: {
+  versions: ConversationVersion[];
+  activePipeline: Record<string, unknown>[];
+  onRestore: (v: ConversationVersion) => void;
+}) {
+  if (versions.length === 0) {
+    return null;
+  }
+  const activeKey = JSON.stringify(activePipeline);
+  // Newest first — the most recent refinement is what analysts usually
+  // want to inspect.
+  const ordered = [...versions].slice().reverse();
+  return (
+    <div className="card card-pad space-y-2">
+      <details>
+        <summary className="cursor-pointer text-sm font-medium text-ink-2 flex items-center gap-2">
+          <span>Versions</span>
+          <span className="pill num text-2xs">{versions.length}</span>
+          <span className="text-2xs text-muted font-normal">
+            · every generated query is saved automatically
+          </span>
+        </summary>
+        <div className="mt-3 divide-y divide-line/60">
+          {ordered.map((v, i) => {
+            const isActive = JSON.stringify(v.pipeline) === activeKey;
+            const idx = versions.length - i; // human-readable: v1 = oldest
+            const when = new Date(v.createdAt);
+            const tsLabel = `${when.toLocaleDateString()} ${when.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+            return (
+              <div key={v.id}
+                className={['py-2 flex items-start gap-3', isActive ? 'bg-accent/5 -mx-2 px-2 rounded' : ''].join(' ')}>
+                <div className="flex-1 min-w-0 space-y-1">
+                  <div className="flex items-center gap-2 flex-wrap text-2xs">
+                    <span className="pill num">v{idx}</span>
+                    {v.source === 'repair' && <span className="pill text-warn">repair · {v.repairCount} attempt{v.repairCount === 1 ? '' : 's'}</span>}
+                    {v.execution.ok
+                      ? <span className="pill-ok">{v.execution.count ?? 0} rows{v.execution.truncated ? ' · trunc' : ''}{v.execution.took !== undefined ? ` · ${v.execution.took} ms` : ''}</span>
+                      : <span className="pill-err">execution failed</span>}
+                    {v.verification && !v.verification.ok && <span className="pill text-warn" title={v.verification.issue}>verification flagged</span>}
+                    <span className="text-muted">{tsLabel}</span>
+                    {isActive && <span className="text-accent-hi">· current</span>}
+                  </div>
+                  {v.triggerMessage && (
+                    <div dir="auto" className="text-xs text-ink-2 truncate" title={v.triggerMessage}>
+                      <span className="text-muted">prompt: </span>{v.triggerMessage}
+                    </div>
+                  )}
+                  <div className="text-2xs text-muted truncate" title={v.collection}>
+                    <span className="font-mono">{v.collection}</span> · {v.pipeline.length} stage{v.pipeline.length === 1 ? '' : 's'}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="btn-ghost btn-sm shrink-0"
+                  disabled={isActive}
+                  onClick={() => onRestore(v)}
+                  title={isActive ? 'This version is currently active' : 'Load this pipeline back into the report pane'}>
+                  {isActive ? 'Current' : 'Restore'}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      </details>
     </div>
   );
 }

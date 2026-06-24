@@ -1,11 +1,11 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
-import { Db } from 'mongodb';
+import { Db, ObjectId } from 'mongodb';
 import { requireRole } from '@/lib/auth';
 import { getSchema, type SchemaDigest } from '@/lib/schema';
 import { agenticReport, type ChatMessage, type LlmReport, type AgenticTurn } from '@/lib/llm';
 import { validatePipeline, lowerPipeline } from '@/lib/pipeline-guard';
-import { dataDb, getServerInfo } from '@/lib/mongo';
+import { dataDb, biDb, getServerInfo } from '@/lib/mongo';
 import { env } from '@/lib/env';
 
 export const runtime = 'nodejs';
@@ -39,7 +39,17 @@ const Body = z.object({
   }).nullish(),
   execute: z.boolean().optional(),
   maxRepairs: z.number().int().min(0).max(4).optional(),
+  // When the client has a persisted conversation, it sends the id so the
+  // server can append a version snapshot to the conversation doc after a
+  // successful report turn. Optional: ad-hoc / unsaved runs (no id yet)
+  // simply skip the version write \u2014 the chat still works end-to-end.
+  conversationId: z.string().optional(),
 });
+
+// Cap the embedded versions array so a long-lived conversation can't grow
+// the doc indefinitely. 50 snapshots is enough for any realistic refining
+// session; older versions are dropped from the head when the cap is hit.
+const MAX_VERSIONS_PER_CONVERSATION = 50;
 
 // Keep the prompt focused on the most recent exchanges. Earlier turns are
 // summarised by the `lastReport` snapshot the client sends anyway, so we
@@ -375,14 +385,14 @@ async function callAgent(
 }
 
 export async function POST(req: Request) {
-  try { await requireRole('admin', 'analyst'); } catch (r) { return r as Response; }
+  let me; try { me = await requireRole('admin', 'analyst'); } catch (r) { return r as Response; }
   // Wrap the rest of the handler so any uncaught exception (LLM config
   // error, mongo connection failure, schema-load crash, ...) becomes a
   // structured JSON response. The agentic client parses every response
   // as JSON, so an HTML 500 page bubbles up as a cryptic "Unexpected
   // token '<'" error and the user can't recover.
   try {
-    return await handleAgenticPost(req);
+    return await handleAgenticPost(req, me.sub);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return NextResponse.json({
@@ -393,7 +403,69 @@ export async function POST(req: Request) {
   }
 }
 
-async function handleAgenticPost(req: Request): Promise<Response> {
+// A version snapshot persisted into agentic_conversations.versions on every
+// successful report turn. Captures the full generated query plus the
+// execution / verification verdict so analysts can review prior pipelines,
+// compare diffs, and restore an earlier version into the active report pane
+// without having to replay the chat.
+interface ConversationVersion {
+  id: string;
+  createdAt: Date;
+  // 'initial' = first report this turn produced.
+  // 'repair'  = a self-repair attempt succeeded after one or more failures.
+  source: 'initial' | 'repair';
+  collection: string;
+  pipeline: Record<string, unknown>[];
+  display: LlmReport['display'];
+  explanation: string;
+  warnings: string[];
+  // Lightweight execution stats only \u2014 rows are NOT persisted (bulky,
+  // stale fast, and the analyst can re-execute the pipeline if needed).
+  execution: {
+    ok: boolean;
+    count?: number;
+    took?: number;
+    truncated?: boolean;
+    error?: string;
+  };
+  // Present only when the post-execution verifier flagged the result.
+  verification?: { ok: false; issue: string };
+  // First ~200 chars of the user message that triggered this version,
+  // so the versions list is readable without expanding every entry.
+  triggerMessage: string;
+  // Number of repair attempts the loop took before this version was
+  // produced. 0 for a clean first-try report.
+  repairCount: number;
+}
+
+async function appendConversationVersion(
+  conversationId: string, userId: string, v: ConversationVersion,
+): Promise<boolean> {
+  if (!ObjectId.isValid(conversationId)) return false;
+  try {
+    const db = await biDb();
+    const r = await db.collection('agentic_conversations').updateOne(
+      { _id: new ObjectId(conversationId), userId },
+      {
+        // $slice with a negative N keeps the most-recent N entries, dropping
+        // older ones from the head of the array. We $push first, then trim,
+        // atomically.
+        $push: { versions: { $each: [v], $slice: -MAX_VERSIONS_PER_CONVERSATION } },
+        $set: { updatedAt: new Date() },
+      // The $push + $slice combo isn't expressible in the strict TS types
+      // the driver ships, but the BSON server understands it natively.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any,
+    );
+    return r.matchedCount > 0;
+  } catch {
+    // Version write is best-effort: never fail the agentic turn because
+    // persistence hit a transient Mongo error.
+    return false;
+  }
+}
+
+async function handleAgenticPost(req: Request, userId: string): Promise<Response> {
   const parsed = Body.safeParse(await req.json().catch(() => null));
   if (!parsed.success) {
     // Surface the first failing path so the client can show a useful hint
@@ -406,7 +478,7 @@ async function handleAgenticPost(req: Request): Promise<Response> {
     }, { status: 400 });
   }
 
-  const { history, lastReport, execute = true, maxRepairs = 2 } = parsed.data;
+  const { history, lastReport, execute = true, maxRepairs = 2, conversationId } = parsed.data;
   // Drop empty/whitespace-only entries before the LLM sees them. Pure-report
   // assistant turns previously persisted with content='' on the client; those
   // shouldn't count as conversation. After filtering we must still have a
@@ -522,12 +594,46 @@ async function handleAgenticPost(req: Request): Promise<Response> {
       ],
     };
   }
+  // Persist a version snapshot when this turn produced a report and the
+  // client supplied a conversation id. The snapshot captures the final
+  // pipeline (post-guard, post-lower) plus execution + verification stats
+  // so the analyst can browse / diff / restore prior queries within the
+  // same conversation. Best-effort \u2014 a Mongo blip never fails the turn.
+  let savedVersion: ConversationVersion | null = null;
+  if (conversationId && execute) {
+    const lastUserMsg = [...trimmed].reverse().find(m => m.role === 'user')?.content ?? '';
+    const v: ConversationVersion = {
+      id: new ObjectId().toHexString(),
+      createdAt: new Date(),
+      source: final.source,
+      collection: finalReport.collection,
+      pipeline: finalReport.pipeline,
+      display: finalReport.display,
+      explanation: finalReport.explanation,
+      warnings: Array.isArray(finalReport.warnings) ? finalReport.warnings : [],
+      execution: {
+        ok: final.execution.ok,
+        count: final.execution.count,
+        took: final.execution.took,
+        truncated: final.execution.truncated,
+        error: final.execution.error,
+      },
+      verification: finalVerdict && !finalVerdict.ok ? { ok: false, issue: finalVerdict.issue } : undefined,
+      triggerMessage: lastUserMsg.slice(0, 200),
+      repairCount: Math.max(0, attempts.length - 1),
+    };
+    const ok = await appendConversationVersion(conversationId, userId, v);
+    if (ok) savedVersion = v;
+  }
   return NextResponse.json({
     kind: 'report',
     message: final.message,
     report: finalReport,
     execution: final.execution,
     verification: finalVerdict && !finalVerdict.ok ? { ok: false, issue: finalVerdict.issue } : { ok: true },
+    // Echo the freshly-saved version (if any) so the client can append it
+    // to its local versions list without a follow-up GET round-trip.
+    savedVersion,
     // Repair attempts in chronological order, excluding the initial turn.
     repairs: attempts.slice(1).map(a => ({
       message: a.message,
