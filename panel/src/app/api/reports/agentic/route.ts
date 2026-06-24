@@ -54,11 +54,23 @@ interface Execution {
   truncated?: boolean;
   error?: string;
 }
+// A verification verdict tells the repair loop whether a SUCCESSFUL execution
+// produced a row set that actually answers the question. Mongo accepting the
+// pipeline is necessary but not sufficient: the LSH-style "field declared in
+// $project but missing from every row" trap, all-null computed columns, and
+// leaked EJSON wrappers all look fine to the driver and still represent a
+// bogus answer.
+type Verdict = { ok: true } | { ok: false, issue: string };
 interface Attempt {
   source: 'initial' | 'repair';
   message: string;
   report: LlmReport;
   execution: Execution;
+  // Present only on attempts where execution succeeded but verification
+  // flagged a semantic problem. The string is fed to the next repair turn
+  // as pendingError and surfaced as a warning on the final response if it
+  // survives all repairs.
+  verification?: Verdict;
 }
 
 const ALLOWED_DISPLAYS = ['table', 'bar', 'line', 'pie', 'area'] as const;
@@ -130,6 +142,141 @@ async function runReport(db: Db, report: LlmReport, version: [number, number]): 
   } catch (e) {
     return { sealed, execution: { ok: false, error: e instanceof Error ? e.message : String(e) } };
   }
+}
+
+// Read the keys declared in the FINAL row-shaping stage of a pipeline so
+// the verifier can flag fields that the analyst asked for but that never
+// appear in any output row (the LSH "bare scalar in $project becomes an
+// inclusion flag" trap, $cond branches that all evaluate to undefined,
+// typos in field paths inside expressions, etc.). Returns null when the
+// pipeline doesn't end in a stage we can introspect (e.g. ends in $count).
+function expectedOutputFields(pipeline: Record<string, unknown>[]): string[] | null {
+  for (let i = pipeline.length - 1; i >= 0; i--) {
+    const stage = pipeline[i];
+    if (!stage || typeof stage !== 'object') continue;
+    const stageKey = Object.keys(stage)[0];
+    // $limit / $skip / $sort don't change the shape, keep walking back.
+    if (stageKey === '$limit' || stageKey === '$skip' || stageKey === '$sort' || stageKey === '$unwind') continue;
+    if (stageKey === '$project' || stageKey === '$addFields' || stageKey === '$set') {
+      const spec = (stage as Record<string, unknown>)[stageKey] as Record<string, unknown>;
+      if (!spec || typeof spec !== 'object') return null;
+      const out: string[] = [];
+      for (const [k, v] of Object.entries(spec)) {
+        // Skip _id when explicitly excluded.
+        if (k === '_id' && (v === 0 || v === false)) continue;
+        // Skip pure exclusions in $project.
+        if (stageKey === '$project' && (v === 0 || v === false)) continue;
+        out.push(k);
+      }
+      return out;
+    }
+    if (stageKey === '$group') {
+      const spec = (stage as Record<string, unknown>).$group as Record<string, unknown>;
+      if (!spec || typeof spec !== 'object') return null;
+      return Object.keys(spec);
+    }
+    // $replaceRoot / $replaceWith / $facet / $bucket reshape rows in ways
+    // we can't statically introspect — skip verification rather than
+    // false-positive.
+    return null;
+  }
+  return null;
+}
+
+// Walk rows in the keys derived above and find those that are NULL or
+// undefined in EVERY sampled row. A field declared in $project that's null
+// everywhere is almost always a bug (wrong field path inside an expression,
+// type mismatch in $multiply / $add, $lookup that joined zero matches with
+// preserveNullAndEmptyArrays). One null among many isn't a problem; ALL
+// null is.
+function allNullColumns(rows: Record<string, unknown>[], keys: string[]): string[] {
+  if (rows.length === 0) return [];
+  return keys.filter(k => rows.every(r => r[k] === null || r[k] === undefined));
+}
+
+// Detect EJSON wrappers that leaked into row VALUES (not pipeline source).
+// If we see {$oid:"..."} or {$date:"..."} inside a row, that means the
+// pipeline returned a sub-document where a real BSON value was expected —
+// usually a $literal-wrapped shorthand or a stored field that holds the
+// shorthand as data. Surface it so the agent can fix the projection.
+function findLeakedEjsonWrappers(rows: Record<string, unknown>[]): string[] {
+  const found = new Set<string>();
+  const wrapperKeys = new Set(['$oid', '$date', '$numberLong', '$numberInt', '$numberDouble', '$numberDecimal']);
+  const visit = (v: unknown, path: string): void => {
+    if (v === null || typeof v !== 'object') return;
+    if (Array.isArray(v)) { v.slice(0, 5).forEach((x, i) => visit(x, `${path}[${i}]`)); return; }
+    const o = v as Record<string, unknown>;
+    const ks = Object.keys(o);
+    if (ks.length === 1 && wrapperKeys.has(ks[0])) { found.add(`${path} = {${ks[0]}: ...}`); return; }
+    for (const [k, val] of Object.entries(o)) visit(val, path ? `${path}.${k}` : k);
+  };
+  for (const row of rows.slice(0, 5)) for (const [k, v] of Object.entries(row)) visit(v, k);
+  return [...found];
+}
+
+// Post-execution verification. Runs only when Mongo accepted the pipeline
+// and returned rows; flags semantic problems that look fine to the driver
+// but represent a wrong answer. Conservative on purpose — false positives
+// would cause repair churn and waste the LLM call budget — so we only
+// flag patterns with very low false-positive rates.
+function verifyResult(report: LlmReport, execution: Execution): Verdict {
+  if (!execution.ok || !execution.rows) return { ok: true };
+  const rows = execution.rows;
+  const issues: string[] = [];
+
+  // Bug class 1: fields declared in the final row-shaping stage that never
+  // materialise in output. The LSH problem and its cousins.
+  const expected = expectedOutputFields(report.pipeline);
+  if (expected && expected.length > 0 && rows.length > 0) {
+    const sampleKeys = new Set<string>();
+    for (const r of rows.slice(0, Math.min(rows.length, 5))) for (const k of Object.keys(r)) sampleKeys.add(k);
+    const missing = expected.filter(f => !sampleKeys.has(f));
+    if (missing.length > 0) {
+      issues.push(
+        `The final $project / $addFields / $group stage declared field(s) [${missing.join(', ')}] but they are ABSENT from every returned row. ` +
+        `This usually means a bare scalar literal was treated as an inclusion flag (e.g. "x": 0.5 — wrap in {"$literal": 0.5}), a $cond / $switch branch evaluated to "remove this field", or a typo in a $-prefixed field path inside an expression.`,
+      );
+    }
+  }
+
+  // Bug class 2: computed columns that are null in EVERY row. Strong
+  // signal of a type mismatch in $multiply / $divide / $subtract, a wrong
+  // field path in $-paths, or a $lookup that joined zero documents on
+  // every row with preserveNullAndEmptyArrays=true.
+  if (expected && expected.length > 0 && rows.length >= 3) {
+    const nullCols = allNullColumns(rows, expected);
+    if (nullCols.length > 0) {
+      issues.push(
+        `Column(s) [${nullCols.join(', ')}] are NULL in every returned row. ` +
+        `Check: (a) the operand field paths exist on the input documents (verify against the schema, not assumed names), ` +
+        `(b) numeric operators ($multiply, $add, $divide) receive numeric operands — wrap stored string numbers with {"$toDouble": "$field"}, ` +
+        `(c) a $lookup with preserveNullAndEmptyArrays=true returns null when no documents match — drop the preserve flag if the join is required, or use an existence filter.`,
+      );
+    }
+  }
+
+  // Bug class 3: EJSON shorthand wrappers leaking into row values. The
+  // pipeline-guard auto-decodes them in pipeline definitions, but if the
+  // pipeline itself OUTPUTS a wrapper (e.g. {$project: { foo: {$literal:
+  // {$oid: "..."}}} }) the wrapper survives into rows and downstream
+  // renderers can't interpret it.
+  const leaks = findLeakedEjsonWrappers(rows);
+  if (leaks.length > 0) {
+    issues.push(
+      `Output rows contain EJSON shorthand wrappers as VALUES: ${leaks.slice(0, 5).join('; ')}. ` +
+      `A $project / $addFields expression returned a sub-document like {"$oid": "..."} or {"$date": "..."} instead of a real BSON value. ` +
+      `Drop the wrapper: emit the bare 24-hex string (for ObjectIds rendered as identifiers) or use {"$toString": "$field"} for explicit string coercion.`,
+    );
+  }
+
+  if (issues.length === 0) return { ok: true };
+  return {
+    ok: false,
+    issue:
+      'Pipeline executed without error but the result set is suspect:\n- ' +
+      issues.join('\n- ') +
+      '\n\nProduce a corrected pipeline. The execution layer will not display this result; re-run after fixing.',
+  };
 }
 
 // Add actionable, pattern-specific guidance on top of the raw MongoDB
@@ -300,16 +447,33 @@ async function handleAgenticPost(req: Request): Promise<Response> {
   }
 
   const initial = await runReport(db, firstNormalized, version);
-  const attempts: Attempt[] = [{ source: 'initial', message: first.message, report: initial.sealed, execution: initial.execution }];
+  const initialVerdict = verifyResult(initial.sealed, initial.execution);
+  const attempts: Attempt[] = [{
+    source: 'initial',
+    message: first.message,
+    report: initial.sealed,
+    execution: initial.execution,
+    verification: initialVerdict.ok ? undefined : initialVerdict,
+  }];
 
   // --- Self-repair loop -----------------------------------------------------
-  // Whenever the latest execution failed, ask the agent to repair using the
-  // error as a "pendingError" context hint, then re-execute. Bounded by
-  // maxRepairs so we never spin.
+  // Trigger the repair turn when EITHER the driver rejected the pipeline
+  // (execution.ok=false) OR the verification layer flagged a semantically
+  // bogus result (missing projected columns, all-null computed columns,
+  // EJSON wrappers leaking into output). Bounded by maxRepairs so we
+  // never spin; verification failures consume the same budget as Mongo
+  // failures by design.
   let current = attempts[0];
-  for (let i = 0; i < maxRepairs && !current.execution.ok; i++) {
-    const errMsg = enrichError(current.execution.error ?? 'unknown_error', current.report);
-    const next = await callAgent(history2, current.report, errMsg, digest, serverInfo);
+  const needsRepair = (a: Attempt) => !a.execution.ok || (a.verification !== undefined && !a.verification.ok);
+  for (let i = 0; i < maxRepairs && needsRepair(current); i++) {
+    // Choose the most actionable pendingError: a Mongo error is always
+    // more specific than a verification verdict, so prefer that when
+    // both could apply (though they're mutually exclusive in practice
+    // because verification only runs on execution.ok=true).
+    const pendingError = !current.execution.ok
+      ? enrichError(current.execution.error ?? 'unknown_error', current.report)
+      : (current.verification && !current.verification.ok ? current.verification.issue : 'unknown_error');
+    const next = await callAgent(history2, current.report, pendingError, digest, serverInfo);
     if ('error' in next) {
       break;
     }
@@ -325,18 +489,51 @@ async function handleAgenticPost(req: Request): Promise<Response> {
       });
     }
     const ran = await runReport(db, norm, version);
-    current = { source: 'repair', message: next.message, report: ran.sealed, execution: ran.execution };
+    const verdict = verifyResult(ran.sealed, ran.execution);
+    current = {
+      source: 'repair',
+      message: next.message,
+      report: ran.sealed,
+      execution: ran.execution,
+      verification: verdict.ok ? undefined : verdict,
+    };
     attempts.push(current);
-    if (current.execution.ok) break;
+    if (!needsRepair(current)) break;
   }
 
   const final = attempts[attempts.length - 1];
+  // If verification still flags the final attempt after the repair budget
+  // is exhausted, append a clear warning to the report so the analyst
+  // knows the result is suspect and the displayed table may be missing
+  // columns or contain bogus null values. We surface this both inside
+  // report.warnings (which the table header chip already renders) and as
+  // a top-level verification.issue so client-side panels can highlight
+  // it more prominently.
+  const finalVerdict: Verdict | undefined = final.verification;
+  let finalReport = final.report;
+  if (finalVerdict && !finalVerdict.ok) {
+    const existing = Array.isArray(final.report.warnings) ? final.report.warnings : [];
+    finalReport = {
+      ...final.report,
+      warnings: [
+        ...existing,
+        'Self-verification flagged this result as suspect after exhausting the repair budget. ' +
+        'Inspect carefully: ' + finalVerdict.issue.split('\n')[0],
+      ],
+    };
+  }
   return NextResponse.json({
     kind: 'report',
     message: final.message,
-    report: final.report,
+    report: finalReport,
     execution: final.execution,
+    verification: finalVerdict && !finalVerdict.ok ? { ok: false, issue: finalVerdict.issue } : { ok: true },
     // Repair attempts in chronological order, excluding the initial turn.
-    repairs: attempts.slice(1).map(a => ({ message: a.message, report: a.report, execution: a.execution })),
+    repairs: attempts.slice(1).map(a => ({
+      message: a.message,
+      report: a.report,
+      execution: a.execution,
+      verification: a.verification ?? { ok: true },
+    })),
   });
 }
