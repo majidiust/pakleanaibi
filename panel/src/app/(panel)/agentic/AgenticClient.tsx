@@ -59,13 +59,30 @@ interface TurnResponse {
   savedVersion?: ConversationVersion | null;
 }
 
+// Metadata about a saved-report template the user is currently customizing.
+// Set when the page is opened via /agentic?fromTemplate=<id>; lets the save
+// modal offer "Update original" alongside the default "Save as new". The
+// shape is the subset of TemplateFull needed to prefill PATCH calls.
+export interface TemplateOrigin {
+  id: string;
+  title: string;
+  description?: string;
+  category?: string;
+  tags: string[];
+  visibility: 'private' | 'shared' | 'public';
+  version: number;
+  createdBy: string;
+  parameters: { key: string; label: string; type: 'string' | 'number' | 'date' | 'boolean' | 'objectId'; required?: boolean }[];
+  sourcePrompt?: string;
+}
+
 const EXAMPLES = [
   'Top 10 users by number of orders in the last 30 days',
   'Monthly revenue from payments for the past 6 months as a line chart',
   'How many orders are in each status? Pie chart please.',
 ];
 
-export function AgenticClient({ user }: { user: ExportUser }) {
+export function AgenticClient({ user, currentUserId, initialTemplateId }: { user: ExportUser; currentUserId: string; initialTemplateId?: string }) {
   const [history, setHistory] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState<'turn' | 'exec' | null>(null);
@@ -75,6 +92,11 @@ export function AgenticClient({ user }: { user: ExportUser }) {
   const [savingTemplate, setSavingTemplate] = useState(false);
   const [savedNotice, setSavedNotice] = useState<string | null>(null);
   const [attached, setAttached] = useState<AttachedField[]>([]);
+  // Set when the page was opened from Saved Reports with ?fromTemplate=<id>.
+  // Drives the save modal's "Update original / Save as new" choice. Cleared
+  // implicitly on resetSession so a fresh "↻ New" run starts a clean
+  // conversation that isn't anchored to the source template.
+  const [templateOrigin, setTemplateOrigin] = useState<TemplateOrigin | null>(null);
   // Conversation persistence: created lazily on the first user turn, then
   // every subsequent change (history or lastReport) is debounced-PATCHed.
   // `historyRefresh` bumps a key the sidebar listens to so its list reorders
@@ -96,6 +118,56 @@ export function AgenticClient({ user }: { user: ExportUser }) {
   useEffect(() => {
     if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
   }, [history, busy]);
+
+  // When the page is opened from Saved Reports with ?fromTemplate=<id>, fetch
+  // the template once on mount and preload it into the active report pane.
+  // The chat is seeded with a single assistant bubble that names the template
+  // and invites the user to describe what to change. Failures fall back to a
+  // friendly notice; the user can still chat from scratch.
+  useEffect(() => {
+    if (!initialTemplateId) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const r = await fetch(`/api/reports/templates/${initialTemplateId}`);
+        if (!r.ok) {
+          console.warn('[agentic] preload template non-2xx', r.status);
+          if (!cancelled) setErr('I couldn\u2019t load that saved report. You can still start a new conversation here.');
+          return;
+        }
+        const j = await r.json() as { template: {
+          id: string; title: string; description?: string; category?: string;
+          tags?: string[]; visibility: 'private' | 'shared' | 'public';
+          version: number; createdBy: string;
+          collection: string; pipeline: Record<string, unknown>[];
+          display: LlmReport['display']; outputFields?: string[];
+          parameters: TemplateOrigin['parameters']; sourcePrompt?: string;
+        } };
+        if (cancelled) return;
+        const t = j.template;
+        setReport({
+          collection: t.collection,
+          pipeline: t.pipeline,
+          display: t.display,
+          explanation: t.description?.trim() || t.sourcePrompt?.trim() || `Loaded from saved report \u201c${t.title}\u201d.`,
+          warnings: [],
+        });
+        setTemplateOrigin({
+          id: t.id, title: t.title, description: t.description,
+          category: t.category, tags: t.tags ?? [], visibility: t.visibility,
+          version: t.version, createdBy: t.createdBy,
+          parameters: t.parameters ?? [], sourcePrompt: t.sourcePrompt,
+        });
+        const seed = `Loaded saved report \u201c${t.title}\u201d (collection \`${t.collection}\`, ${t.pipeline.length} stage${t.pipeline.length === 1 ? '' : 's'}). Tell me what you\u2019d like to change \u2014 add a filter, group differently, switch the chart type, etc. When the result looks right, use \u2606 Save to update this template or branch into a new one.`;
+        setHistory([{ role: 'assistant', content: seed, kind: 'question' }]);
+        setExecution(null);
+      } catch (e) {
+        console.warn('[agentic] preload template failed', e);
+        if (!cancelled) setErr('I couldn\u2019t reach the server to load that saved report. You can still start a new conversation here.');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [initialTemplateId]);
 
   const sendTurn = useCallback(async (text: string) => {
     const trimmed = text.trim();
@@ -377,6 +449,9 @@ export function AgenticClient({ user }: { user: ExportUser }) {
     setHistory([]); setReport(null); setExecution(null); setErr(null); setInput(''); setAttached([]);
     setConversationId(null);
     setVersions([]);
+    // Drop the template anchor so a fresh session isn't accidentally
+    // re-saved on top of the source template.
+    setTemplateOrigin(null);
     lastSavedRef.current = '';
   }
 
@@ -475,6 +550,7 @@ export function AgenticClient({ user }: { user: ExportUser }) {
           lastUserPrompt={lastUserPrompt}
           onRetry={() => { if (lastUserPrompt) sendTurn(lastUserPrompt); }}
           onRephrase={() => { if (lastUserPrompt) setInput(lastUserPrompt); }}
+          templateOrigin={templateOrigin}
         />
         <ChatPanel
           history={history} input={input} busy={busy} chatRef={chatRef}
@@ -491,10 +567,19 @@ export function AgenticClient({ user }: { user: ExportUser }) {
         <SaveTemplateModal
           report={report}
           sourcePrompt={lastUserPrompt}
+          origin={templateOrigin}
+          currentUserId={currentUserId}
           onClose={() => setSavingTemplate(false)}
-          onSaved={() => {
+          onSaved={(_id, mode) => {
             setSavingTemplate(false);
-            setSavedNotice('Saved to Saved Reports. Find it in the sidebar to run it again with different parameters.');
+            setSavedNotice(mode === 'update'
+              ? 'Saved Reports updated. The previous body is kept as v' + (templateOrigin?.version ?? '?') + ' in the version history.'
+              : 'Saved to Saved Reports. Find it in the sidebar to run it again with different parameters.');
+            // After a successful update, refresh the origin's version so the
+            // pill and any subsequent save reflects the new state.
+            if (mode === 'update' && templateOrigin) {
+              setTemplateOrigin({ ...templateOrigin, version: templateOrigin.version + 1 });
+            }
           }}
         />
       )}
@@ -502,7 +587,7 @@ export function AgenticClient({ user }: { user: ExportUser }) {
   );
 }
 
-function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, canSave, versions, onRestoreVersion, lastUserPrompt, onRetry, onRephrase }: {
+function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, canSave, versions, onRestoreVersion, lastUserPrompt, onRetry, onRephrase, templateOrigin }: {
   report: LlmReport | null; execution: Execution | null;
   busy: 'turn' | 'exec' | null; onExecute: () => void;
   onSaveAsTemplate: () => void;
@@ -512,6 +597,7 @@ function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, can
   lastUserPrompt: string | undefined;
   onRetry: () => void;
   onRephrase: () => void;
+  templateOrigin: TemplateOrigin | null;
 }) {
   if (!report) {
     return (
@@ -542,14 +628,21 @@ function ResultPanel({ report, execution, busy, onExecute, onSaveAsTemplate, can
               <span className="pill-ok num">{execution.took} ms · {execution.count} rows{execution.truncated ? ' · truncated' : ''}</span>
             )}
             {execution && !execution.ok && <span className="pill-err">execution failed</span>}
+            {templateOrigin && (
+              <span className="pill-accent" title={`Customizing saved report \u201c${templateOrigin.title}\u201d (v${templateOrigin.version})`}>
+                ✦ from &ldquo;{templateOrigin.title}&rdquo; · v{templateOrigin.version}
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-1.5">
             <button
               className="btn-ghost btn-sm"
               disabled={!canSave || busy !== null}
               onClick={onSaveAsTemplate}
-              title={canSave ? 'Save this pipeline as a reusable report template' : 'Execute the query successfully before saving'}>
-              ☆ Save as template
+              title={canSave
+                ? (templateOrigin ? 'Update the source template or branch into a new one' : 'Save this pipeline as a reusable report template')
+                : 'Execute the query successfully before saving'}>
+              ☆ {templateOrigin ? 'Save changes' : 'Save as template'}
             </button>
             <button className="btn-primary btn-sm" disabled={busy !== null} onClick={onExecute}>
               {busy === 'exec' ? 'Running…' : '▶ Execute'}

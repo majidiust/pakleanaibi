@@ -1,5 +1,6 @@
 'use client';
 import { useState } from 'react';
+import { useRouter } from 'next/navigation';
 import type { Role } from '@/lib/auth';
 import type { TemplateDetail } from './types';
 import { DataTable } from '@/components/DataTable';
@@ -26,6 +27,7 @@ export function TemplateDetailPanel({
   onAction: (action: 'duplicate' | 'delete', id: string) => void;
   onChanged: () => void;
 }) {
+  const router = useRouter();
   const [paramValues, setParamValues] = useState<Record<string, unknown>>({});
   const [running, setRunning] = useState(false);
   const [runErr, setRunErr] = useState<string | null>(null);
@@ -108,6 +110,16 @@ export function TemplateDetailPanel({
             </div>
           </div>
           <div className="flex items-center gap-1.5 flex-wrap">
+            {/* Open the saved pipeline in the agentic console for natural-language
+                refinement. Once the analyst is happy with the new shape they
+                can either update this template or branch into a new one from
+                the SaveTemplateModal. */}
+            <button
+              className="btn-primary btn-sm"
+              onClick={() => router.push(`/agentic?fromTemplate=${template.id}`)}
+              title="Load this pipeline into the agentic console to refine it conversationally">
+              ✦ Customize in Agentic
+            </button>
             {canEdit && <button className="btn-ghost btn-sm" onClick={() => setEditing(true)}>Edit</button>}
             <button className="btn-ghost btn-sm" onClick={() => onAction('duplicate', template.id)}>Duplicate</button>
             <button className="btn-ghost btn-sm" onClick={() => setShowQuery(s => !s)}>
