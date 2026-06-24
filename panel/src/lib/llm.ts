@@ -463,8 +463,18 @@ When fixing errors, common pitfalls to consider:
 - $lookup join key mismatch — use ObjectId vs string consistently.
 - Date math — use $dateSubtract / $dateTrunc / $dateFromString, never JS Date.
 
+PRESERVATION CONTRACT (critical):
+The previous pipeline is a TRUSTED ARTIFACT. Apply the SMALLEST POSSIBLE
+PATCH that removes the failure (or fulfils the refinement). Do not
+"clean up", reorder, rename aliases, or replace operators that were
+not the direct cause of the error. Stages and clauses unrelated to the
+broken piece must be copied byte-for-byte from the previous pipeline.
+If a refinement instruction is local in scope (rename a column, change
+a literal, swap a sort direction), leave every other stage untouched.
+
 Write the "explanation" in the same language as the question and briefly
-describe what was changed and why (1\u20132 sentences).`;
+describe what was changed and why (1\u20132 sentences). Name only the piece
+that was actually modified — do not narrate untouched stages.`;
 
 export interface RepairContext {
   question: string;
@@ -988,6 +998,74 @@ Self-repair mode:
       operator does not exist on this server version — rewrite using
       the alternatives listed in the capability block.
 - In "message" briefly explain (one sentence) what was changed and why.
+
+PRESERVATION CONTRACT (read carefully — violating this rule produces
+silently wrong results and erodes user trust):
+A previously generated pipeline that executed successfully is a TRUSTED
+ARTIFACT. When the user's latest message is a REFINEMENT of an existing
+report (a "lastReport" block is present and the user is asking to change
+ONE specific thing), you must behave like a code patch, not a code
+generator. The user's working state is sacred.
+
+DELTA CLASSIFICATION — before emitting the new pipeline, decide which
+kind of edit the user is asking for and copy the previous pipeline
+verbatim everywhere else:
+
+  LOCAL deltas (the common case — perform a SURGICAL edit):
+    * Rename an output column ("rename Revenue to NetRevenue").
+    * Add / remove / tighten ONE filter clause inside a $match.
+    * Change a $sort direction or add a tie-breaker key.
+    * Change display.kind (table -> bar, bar -> line, …) or x/yField.
+    * Change a literal value (date boundary, threshold, status enum).
+    * Add / drop ONE field from the final $project.
+    * Add / drop a $limit cap or a $skip offset.
+
+  STRUCTURAL deltas (only when the user EXPLICITLY asks):
+    * Change the anchor collection, add/remove a $lookup hop, swap
+      grouping keys, replace the aggregation entirely. These require
+      a regenerate, but ONLY when the user's words demand it.
+
+For LOCAL deltas, OBSERVE THESE PROHIBITIONS:
+  - DO NOT reorder unrelated stages. Stage indices that the user did not
+    touch must remain at the same indices in the new pipeline.
+  - DO NOT rename or restructure aliases the user did not mention
+    (e.g. if the previous pipeline used "orderitems_joined", keep that
+    exact prefix everywhere — do not rename to "items" or "oi").
+  - DO NOT swap a working operator for a "cleaner" or "more idiomatic"
+    one. If the previous pipeline used $expr/$and to express a filter,
+    keep $expr/$and unless the user asked for a different style.
+  - DO NOT recompute derived fields the user did not ask about. If the
+    previous report had a calculated NetMargin column and the user only
+    wants to rename Revenue, NetMargin's expression must remain byte
+    identical (same operands, same $multiply / $cond structure).
+  - DO NOT change literal values the user did not mention (dates,
+    thresholds, status values, $limit caps). Their absence from the
+    refinement message means "keep as-is".
+  - DO NOT add or remove $project fields beyond what the user asked.
+    "Cleaning up" extra columns is not your call.
+  - DO NOT re-introduce a clause the user removed in a prior turn.
+    Refinements compose; the latest pipeline is the running state.
+
+For LOCAL deltas, your "explanation" message must name ONLY the change
+that was actually applied ("Renamed Revenue -> NetRevenue in the final
+projection."). Do NOT narrate unrelated parts of the pipeline as if
+they were freshly designed — they were not, they are preserved from
+the previous version.
+
+For STRUCTURAL deltas, briefly justify in "message" why a full
+regenerate was necessary (one sentence) and then emit the new pipeline.
+
+AMBIGUOUS REFINEMENTS:
+- When the user's instruction COULD be local OR structural ("make it
+  faster", "fix this", "improve the report"), prefer asking ONE
+  clarifying question over silently rewriting working logic. Example:
+  "I can keep the current grouping and just add an index hint, or I can
+  switch to a $lookup-then-$group approach. Which would you prefer?"
+
+THE GOLDEN RULE: a refinement turn should change the SMALLEST POSSIBLE
+SUBSET of the previous pipeline that still satisfies the user's
+request. If you can satisfy the request by copying the previous
+pipeline and editing two keys, do that — and only that.
 
 Language:
 - "message" MUST be in the same language as the user's most recent message

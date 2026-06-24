@@ -5,6 +5,10 @@ import { requireRole } from '@/lib/auth';
 import { getSchema, type SchemaDigest } from '@/lib/schema';
 import { agenticReport, isLlmOutputError, type ChatMessage, type LlmReport, type AgenticTurn } from '@/lib/llm';
 import { validatePipeline, lowerPipeline } from '@/lib/pipeline-guard';
+import {
+  diffPipelines, classifyRefinementIntent, isOverbroadEdit, summariseDiff,
+} from '@/lib/pipeline-diff';
+import { checkLogicalConsistency } from '@/lib/pipeline-logic';
 import { dataDb, biDb, getServerInfo } from '@/lib/mongo';
 import { env } from '@/lib/env';
 
@@ -114,6 +118,24 @@ function normalizeReport(turn: AgenticTurn): LlmReport | null {
       ? r!.explanation : (turn.message || ''),
     warnings: Array.isArray(r!.warnings) ? r!.warnings.filter((w: unknown): w is string => typeof w === 'string') : [],
   };
+}
+
+// Pre-execution logical consistency check. Returns either the (possibly
+// autofixed) report so execution can proceed, or a 'clarify' verdict so the
+// route can either feed it back into self-repair or surface a friendly
+// question. Stays out of the Mongo round-trip path so we never execute a
+// pipeline we already know is logically broken.
+type PrecheckResult =
+  | { kind: 'ok'; report: LlmReport }
+  | { kind: 'clarify'; issue: string; question: string; rule: string };
+function precheckLogic(report: LlmReport): PrecheckResult {
+  const verdict = checkLogicalConsistency(report.pipeline);
+  if (verdict.ok) return { kind: 'ok', report };
+  if (verdict.mode === 'autofix') {
+    const warnings = [...(report.warnings ?? []), verdict.warning];
+    return { kind: 'ok', report: { ...report, pipeline: verdict.pipeline, warnings } };
+  }
+  return { kind: 'clarify', issue: verdict.issue, question: verdict.question, rule: verdict.rule };
 }
 
 // Validate + execute a single report. Returns the sealed report (with the
@@ -667,11 +689,96 @@ async function handleAgenticPost(req: Request, userId: string, reqId: string): P
       needs: firstTurn.needs ?? null,
     });
   }
-  if (!execute) {
-    return NextResponse.json({ kind: 'report', message: firstTurn.message, report: firstNormalized, execution: null, repairs: [] });
+  // --- Partial-Modification guard ------------------------------------------
+  // When the user phrased a LOCAL refinement (rename / filter / sort / chart
+  // / threshold) but the LLM produced a structurally wide rewrite (anchor
+  // changed, $lookup graph shifted, half the stages churned), give the model
+  // exactly ONE budget slot to re-emit a preserving version. Failing that we
+  // surface a friendly clarification turn so the user can confirm intent
+  // instead of silently shipping a regenerated pipeline. Skipped on first
+  // turns (no lastReport) and on structural / ambiguous refinements.
+  let refinedFirst = firstNormalized;
+  if (lastReport) {
+    const lastUserMsg = [...trimmed].reverse().find(m => m.role === 'user')?.content ?? '';
+    const intent = classifyRefinementIntent(lastUserMsg);
+    if (intent === 'local') {
+      const diff = diffPipelines(
+        lastReport.collection, lastReport.pipeline as Record<string, unknown>[],
+        refinedFirst.collection, refinedFirst.pipeline,
+      );
+      if (isOverbroadEdit(intent, diff)) {
+        console.warn(`[agentic ${reqId}] preservation guard: overbroad edit on local refinement -> ${summariseDiff(diff)}`);
+        if (llmBudget > 0) {
+          const reEmit = await callWithBudget(
+            history2, lastReport,
+            'PRESERVATION_VIOLATION: the previous pipeline executed successfully. The user\u2019s last message is a LOCAL refinement (a single localised change). Your draft response changed too much (' + summariseDiff(diff) + '). Re-emit a CORRECTED full report that copies the previous pipeline verbatim and applies ONLY the smallest change required to satisfy the user\u2019s instruction. Do not reorder stages, do not rename aliases, do not swap operators that already worked. Stages and clauses unrelated to the user\u2019s request must be byte-identical to the previous pipeline.',
+          );
+          if (reEmit.status === 'ok') {
+            const renorm = normalizeReport(reEmit.turn);
+            if (renorm) {
+              const recheck = diffPipelines(
+                lastReport.collection, lastReport.pipeline as Record<string, unknown>[],
+                renorm.collection, renorm.pipeline,
+              );
+              if (!isOverbroadEdit(intent, recheck)) {
+                refinedFirst = renorm;
+                firstTurn = { ...firstTurn, message: reEmit.turn.message || firstTurn.message };
+              } else {
+                // Still overbroad after one re-emit. Escalate as a friendly
+                // clarification rather than executing a likely-wrong rewrite.
+                return NextResponse.json({
+                  kind: 'question',
+                  message: lang === 'fa'
+                    ? `برای اعمال این تغییر، بخش‌های دیگر گزارش هم تغییر می‌کنند (${summariseDiff(recheck)}). آیا می‌خواهید همان ساختار قبلی حفظ شود و فقط همان مورد خواسته‌شده اصلاح شود، یا گزارش از نو ساخته شود؟`
+                    : `Applying this change would also affect ${summariseDiff(recheck)} of the previous report. Should I keep the previous structure and apply only the specific change you asked for, or rebuild the report from scratch?`,
+                  needs: null,
+                  repairs: [],
+                });
+              }
+            }
+          }
+        }
+      }
+    }
   }
 
-  const initial = await runReport(db, firstNormalized, version);
+  if (!execute) {
+    return NextResponse.json({ kind: 'report', message: firstTurn.message, report: refinedFirst, execution: null, repairs: [] });
+  }
+
+  // --- Pre-execution logical consistency check -----------------------------
+  // Catches condition-level bugs (contradictory $match clauses, $limit
+  // before $sort, $match on removed fields, ...) BEFORE we pay the Mongo
+  // round-trip. Autofix verdicts are applied silently with a warning;
+  // clarify verdicts get one budgeted repair attempt, then escalate to a
+  // friendly question instead of executing a pipeline we know is broken.
+  let precheck = precheckLogic(refinedFirst);
+  while (precheck.kind === 'clarify' && llmBudget > 0) {
+    console.warn(`[agentic ${reqId}] logic precheck (${precheck.rule}): ${precheck.issue}`);
+    const repair = await callWithBudget(
+      history2, refinedFirst,
+      `LOGICAL_INCONSISTENCY[${precheck.rule}]: ${precheck.issue} Re-emit the report with this condition resolved. Preserve every other stage byte-for-byte; only adjust the pieces directly involved in the conflict.`,
+    );
+    if (repair.status !== 'ok') break;
+    const renorm = normalizeReport(repair.turn);
+    if (!renorm) break;
+    refinedFirst = renorm;
+    firstTurn = { ...firstTurn, message: repair.turn.message || firstTurn.message };
+    precheck = precheckLogic(refinedFirst);
+  }
+  if (precheck.kind === 'clarify') {
+    return NextResponse.json({
+      kind: 'question',
+      message: lang === 'fa'
+        ? `برای اجرای این گزارش یک ناسازگاری منطقی وجود دارد: ${precheck.question}`
+        : precheck.question,
+      needs: null,
+      repairs: [],
+    });
+  }
+  refinedFirst = precheck.report;
+
+  const initial = await runReport(db, refinedFirst, version);
   if (!initial.execution.ok) {
     console.warn(`[agentic ${reqId}] initial execution failed:`, initial.execution.error);
   }
@@ -719,7 +826,23 @@ async function handleAgenticPost(req: Request, userId: string, reqId: string): P
         repairs: sanitiseRepairs(attempts.slice(1), lang),
       });
     }
-    const ran = await runReport(db, norm, version);
+    // Re-run the logical consistency check on the repair attempt. Autofix
+    // verdicts are applied transparently; clarify verdicts skip execution
+    // and synthesise a failed attempt so the loop spends its next budget
+    // slot fixing the logical conflict instead of the Mongo error.
+    const repairCheck = precheckLogic(norm);
+    if (repairCheck.kind === 'clarify') {
+      console.warn(`[agentic ${reqId}] logic precheck on repair (${repairCheck.rule}): ${repairCheck.issue}`);
+      current = {
+        source: 'repair',
+        message: next.turn.message,
+        report: norm,
+        execution: { ok: false, error: `logical_inconsistency[${repairCheck.rule}]: ${repairCheck.issue}` },
+      };
+      attempts.push(current);
+      continue;
+    }
+    const ran = await runReport(db, repairCheck.report, version);
     if (!ran.execution.ok) {
       console.warn(`[agentic ${reqId}] repair execution failed:`, ran.execution.error);
     }
