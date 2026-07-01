@@ -193,8 +193,17 @@ export function AgenticClient({ user, currentUserId, initialTemplateId }: { user
     // full schema digest, but having the user signal exactly which
     // fields drive the question dramatically reduces the chance of
     // picking the wrong column when several have similar names.
+    // When enum values were pinned on an attached field, list them so the
+    // model builds an $eq (single) / $in (multi) filter with the exact
+    // spellings rather than paraphrasing (e.g. "PAID" vs "paid").
     const attachedBlock = attached.length > 0
-      ? '\n\n[Attached fields]\n' + attached.map(a => `- ${a.collection}.${a.path} (${a.type})`).join('\n')
+      ? '\n\n[Attached fields]\n' + attached.map(a => {
+          const head = `- ${a.collection}.${a.path} (${a.type})`;
+          if (!a.values || a.values.length === 0) return head;
+          const rendered = a.values.map(v => JSON.stringify(v)).join(', ');
+          const op = a.values.length === 1 ? '$eq' : '$in';
+          return `${head} values (${op}): ${rendered}`;
+        }).join('\n')
       : '';
     const userContent = trimmed + attachedBlock;
     const nextHist: ChatMsg[] = [...history, { role: 'user', content: userContent }];
@@ -988,7 +997,11 @@ function ChatPanel({ history, input, busy, chatRef, onInput, onSend, onExample, 
             {attached.map((a, i) => (
               <span key={`${a.collection}.${a.path}.${i}`} className="pill-accent gap-1.5">
                 <span className="font-mono">{a.collection}.{a.path}</span>
-                <span className="text-muted">{a.type}</span>
+                {a.values && a.values.length > 0 ? (
+                  <span className="font-mono text-accent-hi">= {a.values.map(v => String(v)).join(', ')}</span>
+                ) : (
+                  <span className="text-muted">{a.type}</span>
+                )}
                 <button type="button" className="text-muted hover:text-ink"
                   onClick={() => onAttachedChange(attached.filter((_, j) => j !== i))}
                   aria-label={`Remove ${a.collection}.${a.path}`}>✕</button>

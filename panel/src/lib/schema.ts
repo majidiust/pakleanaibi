@@ -3,7 +3,16 @@ import { biDb, dataDb } from './mongo';
 // Builds a compact digest of the data DB schema by sampling each collection.
 // Result is small enough to fit in the LLM context window and is cached in the
 // BI DB with a TTL so frequent reports don't re-sample huge collections.
-export interface FieldInfo { name: string; types: string[]; example?: unknown }
+export interface FieldInfo {
+  name: string;
+  types: string[];
+  example?: unknown;
+  // Enum-like fields: small, stable set of distinct values (order state,
+  // status, tier, ...). Sourced from intel_collections when a scan is
+  // available. Absent when the field is high-cardinality or when no scan
+  // has run yet. Capped upstream at MAX_ENUM_DISTINCT (=12).
+  enumValues?: (string | number | boolean)[];
+}
 export interface CollectionInfo {
   name: string;
   count: number;
@@ -72,6 +81,42 @@ export async function getSchema(force = false): Promise<SchemaDigest> {
     try { infos.push(await sampleCollection(name)); }
     catch { /* skip unreadable */ }
   }
+
+  // Merge enum-like values from the intel scan when available. The digest
+  // sampler only sees 25 docs and stores a single example per field; the
+  // intel discover pass samples 200+ docs, tallies distinct counts, and
+  // marks fields as enum-like when the distinct set is small and stable
+  // (see intel/discover.ts::isEnumish). Surfacing those values here lets
+  // the chat auto-complete filter values for the user AND lets the LLM
+  // build $eq / $in filters against the exact spellings without a round
+  // trip. Best-effort: if no scan has run or the collection isn't
+  // registered, the field simply lacks enumValues.
+  try {
+    const intelDocs = await bi.collection<{
+      name: string;
+      fields?: { path: string; enumValues?: (string | number | boolean)[] }[];
+    }>('intel_collections').find(
+      { name: { $in: infos.map(i => i.name) } },
+      { projection: { name: 1, 'fields.path': 1, 'fields.enumValues': 1 } },
+    ).toArray();
+    const enumsByColl = new Map<string, Map<string, (string | number | boolean)[]>>();
+    for (const d of intelDocs) {
+      const inner = new Map<string, (string | number | boolean)[]>();
+      for (const f of d.fields ?? []) {
+        if (Array.isArray(f.enumValues) && f.enumValues.length > 0) inner.set(f.path, f.enumValues);
+      }
+      if (inner.size > 0) enumsByColl.set(d.name, inner);
+    }
+    for (const info of infos) {
+      const m = enumsByColl.get(info.name);
+      if (!m) continue;
+      for (const f of info.fields) {
+        const ev = m.get(f.name);
+        if (ev) f.enumValues = ev;
+      }
+    }
+  } catch { /* best-effort enrichment; digest still valid without enums */ }
+
   // Pull only relationships that a human approved or created. Suggested /
   // weak / rejected ones are intentionally withheld from the LLM so the
   // model never invents joins from low-confidence guesses.
@@ -199,7 +244,15 @@ export function schemaToPrompt(s: SchemaDigest, opts: SchemaPromptOpts = {}): st
       // an _id without a dedicated date column). Other fields keep the
       // existing terse `name:type` form so the digest stays compact.
       const showExample = ex && (dateLike || f.name === '_id');
-      return showExample ? `${f.name}:${typeTag}=${ex}` : `${f.name}:${typeTag}`;
+      // Enum hint: render the actual allowed values inline so the model
+      // filters with the exact spellings (e.g. state:s{paid|pending|cancelled}).
+      // Cap to 8 values in the prompt to keep the digest compact even when
+      // the intel scan captured more; the picker UI shows the full list.
+      const enumHint = f.enumValues && f.enumValues.length > 0
+        ? `{${f.enumValues.slice(0, 8).map(v => String(v)).join('|')}${f.enumValues.length > 8 ? '|...' : ''}}`
+        : '';
+      const base = showExample ? `${f.name}:${typeTag}=${ex}` : `${f.name}:${typeTag}`;
+      return base + enumHint;
     }).join(', ');
     lines.push(`- ${c.name} (~${c.count} docs): ${fields}`);
   }
