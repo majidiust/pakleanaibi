@@ -4,7 +4,7 @@ import { ObjectId, type Collection } from 'mongodb';
 import { biDb } from '../mongo';
 import type {
   IntelCollection, IntelRelationship, IntelJob, IntelVersion,
-  IntelLearning, IntelAudit,
+  IntelLearning, IntelAudit, IntelEnumLabel,
   IntelReportTemplate, IntelReportTemplateVersion,
 } from './types';
 
@@ -15,6 +15,7 @@ const C = {
   versions: 'intel_versions',
   learning: 'intel_learning',
   audit: 'intel_audit',
+  enumLabels: 'intel_enum_labels',
   templates: 'report_templates',
   templateVersions: 'report_template_versions',
 } as const;
@@ -38,6 +39,7 @@ async function ensureIndexes() {
     db.collection(C.versions).createIndex({ version: -1 }),
     db.collection(C.learning).createIndex({ pattern: 1 }, { unique: true }),
     db.collection(C.audit).createIndex({ ts: -1 }),
+    db.collection(C.enumLabels).createIndex({ collection: 1, path: 1 }, { unique: true }),
     db.collection(C.templates).createIndex({ createdBy: 1, updatedAt: -1 }),
     db.collection(C.templates).createIndex({ visibility: 1, updatedAt: -1 }),
     db.collection(C.templates).createIndex({ category: 1 }),
@@ -65,6 +67,9 @@ export async function intelLearning(): Promise<Collection<IntelLearning>> {
 }
 export async function intelAudit(): Promise<Collection<IntelAudit>> {
   await ensureIndexes(); return (await biDb()).collection<IntelAudit>(C.audit);
+}
+export async function intelEnumLabels(): Promise<Collection<IntelEnumLabel>> {
+  await ensureIndexes(); return (await biDb()).collection<IntelEnumLabel>(C.enumLabels);
 }
 export async function reportTemplates(): Promise<Collection<IntelReportTemplate>> {
   await ensureIndexes(); return (await biDb()).collection<IntelReportTemplate>(C.templates);

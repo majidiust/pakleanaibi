@@ -188,6 +188,26 @@ export interface IntelAudit {
   details?: Record<string, unknown>;
 }
 
+// Human-authored labels for individual enum values. Kept in its own
+// collection (keyed by collection + field path) so intel rescans, which
+// overwrite intel_collections.fields[], can never blow away analyst-authored
+// definitions. Read by the schema digest to feed value semantics into the
+// LLM prompt, and by the chat's EnumHelp popover.
+export interface IntelEnumLabel {
+  _id?: ObjectId;
+  /** Collection name in the data DB. */
+  collection: string;
+  /** Dot-path of the field (matches FieldSample.path). */
+  path: string;
+  /** value -> short human label / definition. Values are stringified for
+   *  the key (JSON.stringify(v) with the surrounding quotes stripped for
+   *  strings) so numeric and boolean enums round-trip cleanly. */
+  labels: Record<string, string>;
+  createdAt: Date;
+  updatedAt: Date;
+  updatedBy?: string;       // user sub of last editor
+}
+
 // -----------------------------------------------------------------------
 // Saved Reports / Report Templates
 // -----------------------------------------------------------------------

@@ -12,6 +12,12 @@ export interface FieldInfo {
   // available. Absent when the field is high-cardinality or when no scan
   // has run yet. Capped upstream at MAX_ENUM_DISTINCT (=12).
   enumValues?: (string | number | boolean)[];
+  // Human-authored short definitions for individual enum values (e.g.
+  // paid="Order fully settled"). Sourced from intel_enum_labels. Fed into
+  // the LLM prompt so the model can map free-text like "unpaid" to the
+  // exact stored code. Only populated for values the analyst has defined;
+  // undefined when no labels have been authored for the field.
+  enumLabels?: Record<string, string>;
 }
 export interface CollectionInfo {
   name: string;
@@ -116,6 +122,35 @@ export async function getSchema(force = false): Promise<SchemaDigest> {
       }
     }
   } catch { /* best-effort enrichment; digest still valid without enums */ }
+
+  // Merge human-authored per-value labels for enum-like fields. Stored in
+  // their own collection (intel_enum_labels) so intel rescans can't wipe
+  // them. Displayed in the chat's EnumHelp popover and rendered inline in
+  // the LLM prompt so the model can map user phrasing ("unpaid orders")
+  // to the exact code stored in the data ("pending" / "cancelled").
+  try {
+    const labelDocs = await bi.collection<{
+      collection: string; path: string; labels?: Record<string, string>;
+    }>('intel_enum_labels').find(
+      { collection: { $in: infos.map(i => i.name) } },
+      { projection: { _id: 0, collection: 1, path: 1, labels: 1 } },
+    ).toArray();
+    const labelsByColl = new Map<string, Map<string, Record<string, string>>>();
+    for (const d of labelDocs) {
+      if (!d.labels || Object.keys(d.labels).length === 0) continue;
+      let inner = labelsByColl.get(d.collection);
+      if (!inner) { inner = new Map(); labelsByColl.set(d.collection, inner); }
+      inner.set(d.path, d.labels);
+    }
+    for (const info of infos) {
+      const m = labelsByColl.get(info.name);
+      if (!m) continue;
+      for (const f of info.fields) {
+        const lbl = m.get(f.name);
+        if (lbl) f.enumLabels = lbl;
+      }
+    }
+  } catch { /* best-effort; digest still valid without labels */ }
 
   // Pull only relationships that a human approved or created. Suggested /
   // weak / rejected ones are intentionally withheld from the LLM so the
@@ -248,8 +283,22 @@ export function schemaToPrompt(s: SchemaDigest, opts: SchemaPromptOpts = {}): st
       // filters with the exact spellings (e.g. state:s{paid|pending|cancelled}).
       // Cap to 8 values in the prompt to keep the digest compact even when
       // the intel scan captured more; the picker UI shows the full list.
+      // When a human authored a definition for a value we append it after
+      // an "=" so the model knows the semantics ("paid=Order fully settled").
+      // Definitions are truncated per-value so a verbose label can't blow
+      // up the prompt budget.
       const enumHint = f.enumValues && f.enumValues.length > 0
-        ? `{${f.enumValues.slice(0, 8).map(v => String(v)).join('|')}${f.enumValues.length > 8 ? '|...' : ''}}`
+        ? (() => {
+            const labels = f.enumLabels ?? {};
+            const shown = f.enumValues.slice(0, 8).map(v => {
+              const key = String(v);
+              const def = labels[key];
+              if (!def) return key;
+              const short = def.length > 40 ? def.slice(0, 40) + '…' : def;
+              return `${key}=${short}`;
+            });
+            return `{${shown.join('|')}${f.enumValues.length > 8 ? '|...' : ''}}`;
+          })()
         : '';
       const base = showExample ? `${f.name}:${typeTag}=${ex}` : `${f.name}:${typeTag}`;
       return base + enumHint;

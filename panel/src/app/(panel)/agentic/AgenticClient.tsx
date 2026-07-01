@@ -4,6 +4,7 @@ import { DataTable } from '@/components/DataTable';
 import { ChartView, type ChartDisplay } from '@/components/ChartView';
 import { SaveTemplateModal } from './SaveTemplateModal';
 import { FieldAttacher, type AttachedField } from './FieldAttacher';
+import { EnumHelp } from './EnumHelp';
 import { ConversationHistory } from './ConversationHistory';
 import { exportConversation, type ExportableConversation, type ExportUser } from './exportConversation';
 import { JalaliDatePicker, type JalaliPickerResult } from '@/components/JalaliDatePicker';
@@ -1022,6 +1023,7 @@ function ChatPanel({ history, input, busy, chatRef, onInput, onSend, onExample, 
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-2">
             <FieldAttacher attached={attached} onChange={onAttachedChange} disabled={busy !== null} />
+            <EnumHelp disabled={busy !== null} />
             <span className="text-2xs text-muted hidden sm:inline">⌘/Ctrl + Enter to send</span>
           </div>
           <button className="btn-primary btn-sm" disabled={!input.trim() || busy !== null} onClick={onSend}>
