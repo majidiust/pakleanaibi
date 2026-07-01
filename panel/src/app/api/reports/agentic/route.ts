@@ -35,13 +35,17 @@ const Body = z.object({
     pipeline: z.array(z.record(z.unknown())),
     display: z.object({
       kind: z.enum(['table', 'bar', 'line', 'pie', 'area']),
-      xField: z.string().optional(),
-      yField: z.string().optional(),
-      seriesField: z.string().optional(),
-      title: z.string().optional(),
+      // .nullish() accepts both undefined AND null. The client persists
+      // absent display fields as JSON null (not undefined), and rejecting
+      // them here dropped the entire turn into the transport-fallback path
+      // where the user saw "\u0641\u0639\u0644\u0627\u064b \u0646\u0645\u06cc\u200c\u062a\u0648\u0627\u0646\u0645..." even for plain chat turns.
+      xField: z.string().nullish(),
+      yField: z.string().nullish(),
+      seriesField: z.string().nullish(),
+      title: z.string().nullish(),
     }),
     explanation: z.string(),
-    warnings: z.array(z.string()).optional(),
+    warnings: z.array(z.string()).nullish(),
   }).nullish(),
   execute: z.boolean().optional(),
   maxRepairs: z.number().int().min(0).max(4).optional(),
@@ -664,7 +668,25 @@ async function handleAgenticPost(req: Request, userId: string, reqId: string): P
     });
   }
 
-  const { history, lastReport, execute = true, maxRepairs = 2, conversationId, parentVersionId } = parsed.data;
+  const { history, lastReport: lastReportRaw, execute = true, maxRepairs = 2, conversationId, parentVersionId } = parsed.data;
+  // Normalise the parsed lastReport to LlmReport: the wire schema uses
+  // .nullish() on display sub-fields (client persists absent props as JSON
+  // null), but LlmReport downstream expects undefined only. Drop nulls
+  // here so a single conversion sits at the transport boundary rather
+  // than every call site defending against both null and undefined.
+  const lastReport: LlmReport | null = lastReportRaw ? {
+    collection: lastReportRaw.collection,
+    pipeline: lastReportRaw.pipeline,
+    display: {
+      kind: lastReportRaw.display.kind,
+      xField: lastReportRaw.display.xField ?? undefined,
+      yField: lastReportRaw.display.yField ?? undefined,
+      seriesField: lastReportRaw.display.seriesField ?? undefined,
+      title: lastReportRaw.display.title ?? undefined,
+    },
+    explanation: lastReportRaw.explanation,
+    warnings: lastReportRaw.warnings ?? undefined,
+  } : null;
   // Drop empty/whitespace-only entries before the LLM sees them. Pure-report
   // assistant turns previously persisted with content='' on the client; those
   // shouldn't count as conversation. After filtering we must still have a
